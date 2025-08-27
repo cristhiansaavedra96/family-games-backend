@@ -59,17 +59,17 @@ function createRoom() {
   const room = {
     id,
     name: `Sala ${roomNumber}`,
-  gameKey: 'bingo', // preparado para múltiples juegos
+    gameKey: 'bingo', // preparado para múltiples juegos
     started: false,
     paused: true,
-  speed: 1, // multiplicador x0.5..x2
-    cardsPerPlayer: 1,
+    speed: 1, // multiplicador x0.5..x2
+    cardsPerPlayer: 1, // Siempre inicializar en 1
     players: new Map(), // socketId -> { name, avatarUrl, avatarId, username, cards: number[][] }
     hostId: null,
     bag: [],
     drawn: [],
     timer: null,
-  announceTimeout: null,
+    announceTimeout: null,
     figuresClaimed: { 
       // Cambio a estructura más detallada: figura -> { playerId, cardIndex, details }
       corners: null, 
@@ -105,6 +105,7 @@ function getRoomsList() {
     })),
     started: r.started,
     hostId: r.hostId,
+    cardsPerPlayer: r.cardsPerPlayer || 1,
   }));
 }
 
