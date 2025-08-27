@@ -146,7 +146,7 @@ function broadcastRoomState(roomId) {
 function stopTimer(room) { if (room.timer) { clearInterval(room.timer); room.timer = null; } }
 function startTimerIfNeeded(room) {
   if (!room.started || room.paused || room.timer) return;
-  const baseMs = 6000;
+  const baseMs = 7500;
   const factor = Number(room.speed) || 1;
   const intervalMs = Math.max(500, Math.round(baseMs / factor));
   room.timer = setInterval(() => drawNextBall(room), intervalMs);
