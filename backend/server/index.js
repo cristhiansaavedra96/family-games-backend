@@ -5,6 +5,9 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const dotenv = require('dotenv');
 const { shuffleBag, generateCard, checkFigures } = require('./games/bingo');
+const { getDataStore } = require('./core/datastore');
+const statsService = require('./services/statsService');
+const dataStore = getDataStore();
 
 dotenv.config();
 
@@ -56,11 +59,12 @@ function createRoom() {
   const room = {
     id,
     name: `Sala ${roomNumber}`,
+  gameKey: 'bingo', // preparado para múltiples juegos
     started: false,
     paused: true,
   speed: 1, // multiplicador x0.5..x2
     cardsPerPlayer: 1,
-    players: new Map(), // socketId -> { name, avatarUrl, cards: number[][] }
+    players: new Map(), // socketId -> { name, avatarUrl, avatarId, username, cards: number[][] }
     hostId: null,
     bag: [],
     drawn: [],
@@ -77,6 +81,8 @@ function createRoom() {
     },
     // Nueva estructura para figuras específicas por jugador y cartón
     specificClaims: new Map(), // "playerId:cardIndex:figure" -> { playerId, cardIndex, figure, details }
+    // Rastreo de figuras completadas por jugador para estadísticas finales
+    playerFigures: new Map(), // playerId -> Set(['column', 'row', 'diagonal'])
     // Nuevos campos para sistema de nueva partida
     gameEnded: false,
     playersReady: new Set(), // Set de socketIds listos para nueva partida
@@ -91,7 +97,12 @@ function getRoomsList() {
   return Array.from(rooms.values()).map(r => ({
     id: r.id,
     name: r.name,
-    players: Array.from(r.players.entries()).map(([sid, p]) => ({ id: sid, name: p.name, avatarUrl: p.avatarUrl })),
+    players: Array.from(r.players.entries()).map(([sid, p]) => ({ 
+      id: sid, 
+      name: p.name, 
+      avatarId: p.avatarId, // Solo enviar avatarId para caché eficiente
+      username: p.username 
+    })),
     started: r.started,
     hostId: r.hostId,
   }));
@@ -108,11 +119,14 @@ function broadcastRoomState(roomId) {
     id: sid,
     name: p.name,
     avatarUrl: p.avatarUrl,
+    avatarId: p.avatarId, // ✅ Incluir avatarId
+    username: p.username,
     cards: p.cards,
   }));
   io.to(roomId).emit('state', {
     roomId,
     name: room.name,
+  gameKey: room.gameKey,
     started: room.started,
     paused: room.paused,
     speed: room.speed,
@@ -160,6 +174,7 @@ function startGame(roomId) {
   room.bag = shuffleBag();
   room.drawn = [];
   room.figuresClaimed = { corners: null, row: null, column: null, diagonal: null, border: null, full: null };
+  room.playerFigures.clear(); // Limpiar figuras rastreadas del juego anterior
   for (const p of room.players.values()) {
     p.cards = Array.from({ length: room.cardsPerPlayer }, () => generateCard());
   }
@@ -272,7 +287,7 @@ function buildClaimDetails(figure, marked) {
   return details;
 }
 
-function checkClaim(roomId, socketId, figure, cardIndex, markedFromClient) {
+async function checkClaim(roomId, socketId, figure, cardIndex, markedFromClient) {
   const room = rooms.get(roomId);
   if (!room) return { ok: false, reason: 'room_not_found' };
   if (room.figuresClaimed[figure]) return { ok: false, reason: 'figure_taken' };
@@ -281,6 +296,21 @@ function checkClaim(roomId, socketId, figure, cardIndex, markedFromClient) {
   const { flags } = valid;
   if (!flags[figure]) return { ok: false, reason: 'invalid' };
   room.figuresClaimed[figure] = socketId;
+  
+  // Rastrear figura completada por jugador (para stats finales)
+  try {
+    const player = rooms.get(roomId)?.players.get(socketId);
+    const pid = player?.username || socketId;
+    
+    if (!room.playerFigures.has(pid)) {
+      room.playerFigures.set(pid, new Set());
+    }
+    room.playerFigures.get(pid).add(figure);
+    
+    console.log(`Player ${pid} completed figure: ${figure}`);
+  } catch (e) {
+    console.error('Error tracking player figure:', e);
+  }
   // Registrar reclamo específico con detalles
   try {
     const details = buildClaimDetails(figure, markedFromClient);
@@ -299,7 +329,8 @@ function checkClaim(roomId, socketId, figure, cardIndex, markedFromClient) {
       roomId,
       playerId: socketId,
       playerName: player.name,
-      playerAvatar: player.avatarUrl,
+      playerUsername: player.username,
+      playerAvatarId: player.avatarId, // Enviar avatarId en lugar de avatarUrl completo
       figures: [figure],
       cardIndex
     });
@@ -315,6 +346,37 @@ function checkClaim(roomId, socketId, figure, cardIndex, markedFromClient) {
     // Enviar gameOver después de que terminen los anuncios en cola
     const pending = room.announcementQueue.length;
     setTimeout(() => {
+      // Stats: resultado de juego con figuras completadas
+      try {
+        const winner = room.players.get(socketId);
+        const winnerId = winner?.username || socketId;
+        
+        // Convertir playerFigures Map a objeto con arrays
+        const playersWithFigures = {};
+        for (const [playerId, figuresSet] of room.playerFigures.entries()) {
+          playersWithFigures[playerId] = Array.from(figuresSet);
+        }
+        
+        // Registrar en dataStore (memoria)
+        dataStore.recordGameResult({ 
+          gameKey: room.gameKey, 
+          roomId, 
+          winnerId, 
+          playersWithFigures 
+        });
+        
+        // Registrar en base de datos
+        statsService.recordGameResult({
+          gameKey: room.gameKey,
+          roomId,
+          winnerId,
+          playersWithFigures
+        });
+        
+        console.log('Game result recorded (full):', { winnerId, playersWithFigures });
+      } catch (e) {
+        console.error('Error recording game result:', e);
+      }
       io.to(roomId).emit('gameOver', { 
         roomId, 
         winner: socketId, 
@@ -360,6 +422,18 @@ function autoClaim(roomId, socketId, cardIndex, markedFromClient) {
       playerName: player.name,
       timestamp: Date.now()
     });
+    
+    // Rastrear figura completada por jugador (para stats finales)
+    try {
+      const pid = player?.username || socketId;
+      if (!room.playerFigures.has(pid)) {
+        room.playerFigures.set(pid, new Set());
+      }
+      room.playerFigures.get(pid).add(f);
+      console.log(`Player ${pid} completed figure: ${f}`);
+    } catch (e) {
+      console.error('Error tracking player figure:', e);
+    }
   }
   
   // Crear anuncios individuales por prioridad
@@ -374,7 +448,8 @@ function autoClaim(roomId, socketId, cardIndex, markedFromClient) {
       roomId,
       playerId: socketId,
       playerName: player.name,
-      playerAvatar: player.avatarUrl,
+      playerUsername: player.username,
+      playerAvatarId: player.avatarId, // Enviar avatarId en lugar de avatarUrl completo
       figures: [figure], // Solo una figura por anuncio
       cardIndex
     });
@@ -394,6 +469,37 @@ function autoClaim(roomId, socketId, cardIndex, markedFromClient) {
   // Si terminó el juego, enviar gameOver después de los anuncios
   if (newly.includes('full')) {
     setTimeout(() => {
+      // Stats: resultado de juego con figuras completadas
+      try {
+        const winner = room.players.get(socketId);
+        const winnerId = winner?.username || socketId;
+        
+        // Convertir playerFigures Map a objeto con arrays
+        const playersWithFigures = {};
+        for (const [playerId, figuresSet] of room.playerFigures.entries()) {
+          playersWithFigures[playerId] = Array.from(figuresSet);
+        }
+        
+        // Registrar en dataStore (memoria)
+        dataStore.recordGameResult({ 
+          gameKey: room.gameKey, 
+          roomId, 
+          winnerId, 
+          playersWithFigures 
+        });
+        
+        // Registrar en base de datos
+        statsService.recordGameResult({
+          gameKey: room.gameKey,
+          roomId,
+          winnerId,
+          playersWithFigures
+        });
+        
+        console.log('Game result recorded (multiple):', { winnerId, playersWithFigures });
+      } catch (e) {
+        console.error('Error recording game result:', e);
+      }
       io.to(roomId).emit('gameOver', { 
         roomId, 
         winner: socketId, 
@@ -447,10 +553,29 @@ io.on('connection', (socket) => {
     broadcastRoomsList();
   });
 
-  socket.on('createRoom', ({ player, cardsPerPlayer }) => {
+  socket.on('createRoom', async ({ player, cardsPerPlayer }) => {
     const room = createRoom();
-    const { name, avatarUrl } = player || {};
-    room.players.set(socket.id, { name, avatarUrl, cards: [], joinedAt: Date.now() });
+    let { name, avatarUrl, username } = player || {};
+    let avatarId = null;
+    
+    // 🖼️ Sincronizar avatar desde la base de datos si existe
+    try {
+      if (username) {
+        const existingPlayer = await statsService.getPlayerByUsername(username);
+        if (existingPlayer && existingPlayer.avatarUrl) {
+          console.log(`🔄 Avatar sincronizado para ${username}: ${existingPlayer.avatarId}`);
+          avatarUrl = existingPlayer.avatarUrl;
+          avatarId = existingPlayer.avatarId;
+        }
+        const player = await statsService.ensurePlayer(username, name, avatarUrl);
+        avatarId = player.avatarId;
+      }
+      dataStore.ensurePlayer(username || socket.id, name, avatarUrl); 
+    } catch (e) {
+      console.warn('Error ensuring player in createRoom:', e);
+    }
+    
+    room.players.set(socket.id, { name, avatarUrl, avatarId, username, cards: [], joinedAt: Date.now() });
     room.hostId = socket.id;
     if (cardsPerPlayer) room.cardsPerPlayer = Math.max(1, Math.min(4, Number(cardsPerPlayer) || 1));
     socket.join(room.id);
@@ -460,11 +585,30 @@ io.on('connection', (socket) => {
     broadcastRoomsList();
   });
 
-  socket.on('joinRoom', ({ roomId, player }) => {
+  socket.on('joinRoom', async ({ roomId, player }) => {
     const room = rooms.get(roomId);
     if (!room) return;
-    const { name, avatarUrl } = player || {};
-    room.players.set(socket.id, { name, avatarUrl, cards: [], joinedAt: Date.now() });
+    let { name, avatarUrl, username } = player || {};
+    let avatarId = null;
+    
+    // 🖼️ Sincronizar avatar desde la base de datos si existe
+    try {
+      if (username) {
+        const existingPlayer = await statsService.getPlayerByUsername(username);
+        if (existingPlayer && existingPlayer.avatarUrl) {
+          console.log(`🔄 Avatar sincronizado para ${username}: ${existingPlayer.avatarId}`);
+          avatarUrl = existingPlayer.avatarUrl;
+          avatarId = existingPlayer.avatarId;
+        }
+        const player = await statsService.ensurePlayer(username, name, avatarUrl);
+        avatarId = player.avatarId;
+      }
+      dataStore.ensurePlayer(username || socket.id, name, avatarUrl); 
+    } catch (e) {
+      console.warn('Error ensuring player in joinRoom:', e);
+    }
+    
+    room.players.set(socket.id, { name, avatarUrl, avatarId, username, cards: [], joinedAt: Date.now() });
     if (!room.hostId) room.hostId = socket.id;
     socket.join(room.id);
     socket.data.roomId = room.id;
@@ -586,7 +730,13 @@ io.on('connection', (socket) => {
   socket.on('getState', ({ roomId }) => {
     const room = rooms.get(roomId || socket.data.roomId);
     if (!room) return;
-    const publicPlayers = Array.from(room.players.entries()).map(([sid, p]) => ({ id: sid, name: p.name, avatarUrl: p.avatarUrl, cards: p.cards }));
+  const publicPlayers = Array.from(room.players.entries()).map(([sid, p]) => ({ 
+    id: sid, 
+    name: p.name, 
+    avatarId: p.avatarId, // Solo enviar avatarId para caché eficiente
+    username: p.username, 
+    cards: p.cards 
+  }));
     socket.emit('state', {
       roomId: room.id,
       name: room.name,
@@ -601,6 +751,65 @@ io.on('connection', (socket) => {
       gameEnded: room.gameEnded,
       playersReady: Array.from(room.playersReady),
     });
+  });
+
+  // Stats y Leaderboard
+  socket.on('getStats', async ({ playerId }, cb) => {
+    try {
+      // usar username prioritariamente si está asociado al jugador en sala
+      const room = rooms.get(socket.data.roomId);
+      const p = room?.players.get(socket.id);
+      const username = playerId || p?.username;
+      
+      if (username) {
+        // Usar Prisma/statsService para datos persistentes
+        const stats = await statsService.getPlayerStats(username, 'bingo');
+        if (typeof cb === 'function') cb({ ok: true, stats });
+        else socket.emit('stats', { ok: true, stats });
+      } else {
+        // Fallback a dataStore si no hay username
+        const stats = dataStore.getPlayerStats(socket.id) || { totalGames: 0, wins: 0, points: 0 };
+        if (typeof cb === 'function') cb({ ok: true, stats });
+        else socket.emit('stats', { ok: true, stats });
+      }
+    } catch (e) {
+      console.error('Error getting stats:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
+  });
+  
+  socket.on('getLeaderboard', async ({ gameKey, limit }, cb) => {
+    try {
+      const leaderboard = await statsService.getLeaderboard(gameKey || 'bingo', limit || 10);
+      if (typeof cb === 'function') cb({ ok: true, leaderboard });
+      else socket.emit('leaderboard', { ok: true, leaderboard });
+    } catch (e) {
+      console.error('Error getting leaderboard:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
+  });
+
+  // Sincronización de avatares
+  socket.on('getAvatarById', async ({ avatarId }, cb) => {
+    try {
+      const avatar = await statsService.getAvatarById(avatarId);
+      if (typeof cb === 'function') cb({ ok: !!avatar, avatar });
+    } catch (e) {
+      console.error('Error getting avatar:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on('syncAvatars', async ({ lastSync }, cb) => {
+    try {
+      const avatars = lastSync ? 
+        await statsService.getPlayersWithAvatarsUpdatedAfter(lastSync) :
+        await statsService.getAllPlayersWithAvatars();
+      if (typeof cb === 'function') cb({ ok: true, avatars });
+    } catch (e) {
+      console.error('Error syncing avatars:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
   });
 
   // Manejar mensajes de chat
@@ -621,6 +830,148 @@ io.on('connection', (socket) => {
     console.log('Broadcasting chat message to room:', roomId || socket.data.roomId);
     // Reenviar el mensaje a todos en la sala
     io.to(roomId || socket.data.roomId).emit('chatMessage', message);
+  });
+
+  // Nuevos endpoints para rankings y búsqueda
+  socket.on('getTopPlayers', async ({ gameKey, criteria, limit }, cb) => {
+    try {
+      const topPlayers = await statsService.getTopPlayers(gameKey || 'bingo', criteria || 'points', limit || 10);
+      if (typeof cb === 'function') cb({ ok: true, topPlayers });
+    } catch (e) {
+      console.error('Error getting top players:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on('searchPlayers', async ({ query, limit }, cb) => {
+    try {
+      const players = await statsService.searchPlayers(query, limit || 10);
+      if (typeof cb === 'function') cb({ ok: true, players });
+    } catch (e) {
+      console.error('Error searching players:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
+  });
+
+  // Endpoint para obtener avatar por avatarId (para caché eficiente)
+  socket.on('getAvatar', async ({ avatarId }, cb) => {
+    console.log('📋 Received getAvatar request:', { avatarId });
+    
+    try {
+      if (!avatarId) {
+        if (typeof cb === 'function') cb({ ok: false, error: 'AvatarId is required' });
+        return;
+      }
+
+      // Buscar jugador por avatarId en la base de datos
+      const player = await statsService.getPlayerByAvatarId(avatarId);
+      
+      if (!player || !player.avatarUrl) {
+        console.log('❌ Avatar not found:', avatarId);
+        if (typeof cb === 'function') cb({ ok: false, error: 'Avatar not found' });
+        return;
+      }
+
+      console.log(`✅ Avatar found: ${player.username} -> ${avatarId} (${(player.avatarUrl.length/1024).toFixed(1)}KB)`);
+      
+      if (typeof cb === 'function') cb({ 
+        ok: true, 
+        avatar: {
+          avatarId: player.avatarId,
+          avatarUrl: player.avatarUrl,
+          username: player.username
+        }
+      });
+    } catch (e) {
+      console.error('Error getting avatar:', e);
+      if (typeof cb === 'function') cb({ ok: false, error: e.message });
+    }
+  });
+
+  // Endpoint para actualizar perfil
+  socket.on('updateProfile', async ({ username, name, avatarUrl }, cb) => {
+    console.log('📥 Received updateProfile request:', { 
+      username, 
+      name, 
+      hasAvatar: !!avatarUrl,
+      avatarSizeKB: avatarUrl ? (avatarUrl.length / 1024).toFixed(2) : 0
+    });
+    
+    try {
+      if (!username) {
+        console.log('❌ updateProfile failed: Username is required');
+        if (typeof cb === 'function') cb({ ok: false, error: 'Username is required' });
+        return;
+      }
+
+      if (avatarUrl) {
+        console.log('🖼️ Avatar details:');
+        console.log('   - Size:', avatarUrl.length, 'characters');
+        console.log('   - Size in MB:', (avatarUrl.length / 1024 / 1024).toFixed(2));
+        console.log('   - Starts with:', avatarUrl.substring(0, 50));
+        
+        // Verificar si es una imagen base64 válida
+        if (!avatarUrl.startsWith('data:image/')) {
+          console.log('⚠️ Avatar does not start with data:image/');
+        }
+        
+        // Validar tamaño máximo más estricto (800KB en base64)
+        if (avatarUrl.length > 800 * 1024) {
+          console.log('❌ updateProfile failed: Avatar too large (max 800KB)');
+          if (typeof cb === 'function') cb({ ok: false, error: 'La imagen es demasiado grande (máximo 800KB)' });
+          return;
+        }
+      }
+
+      console.log('💾 Updating player profile in database...');
+      // Actualizar en la base de datos usando statsService
+      const player = await statsService.ensurePlayer(username, name, avatarUrl);
+      console.log('Player profile updated in database:', player.username);
+      
+      // También actualizar en dataStore para la sesión actual
+      try { 
+        dataStore.ensurePlayer(username, name, avatarUrl); 
+        console.log('Player profile updated in dataStore');
+      } catch (e) {
+        console.warn('Error updating dataStore:', e);
+      }
+
+      // 🔄 Sincronizar el perfil actualizado en todas las salas donde esté el jugador
+      console.log('🔄 Syncing updated profile across rooms...');
+      for (const [roomId, room] of rooms.entries()) {
+        const playerInRoom = room.players.get(socket.id);
+        if (playerInRoom && playerInRoom.username === username) {
+          // Actualizar los datos del jugador en esta sala
+          room.players.set(socket.id, { 
+            ...playerInRoom, 
+            name: player.name, 
+            avatarUrl: player.avatarUrl 
+          });
+          
+          // Notificar a todos en la sala sobre la actualización
+          console.log(`🔄 Broadcasting updated profile to room ${roomId}`);
+          broadcastRoomState(roomId);
+        }
+      }
+
+      const response = { 
+        ok: true, 
+        player: {
+          username: player.username,
+          name: player.name,
+          avatarUrl: player.avatarUrl,
+          avatarId: player.avatarId
+        }
+      };
+      
+      console.log('Sending updateProfile response:', response);
+      if (typeof cb === 'function') cb(response);
+    } catch (e) {
+      console.error('Error updating profile:', e);
+      const errorResponse = { ok: false, error: e.message };
+      console.log('Sending updateProfile error response:', errorResponse);
+      if (typeof cb === 'function') cb(errorResponse);
+    }
   });
 
   socket.on('disconnect', () => {

@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model Player {
+  username        String            @id
+  name            String?           @db.VarChar(255)
+  avatarUrl       String?           @db.LongText
+  avatarId        String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @default(now())
+  PlayerGameStats PlayerGameStats[]
+
+  @@index([avatarId], map: "idx_avatarId")
+  @@index([updatedAt], map: "idx_updatedAt")
+}
+
+model PlayerGameStats {
+  id             Int    @id @default(autoincrement())
+  playerUsername String
+  gameKey        String
+  points         Int    @default(0)
+  totalGames     Int    @default(0)
+  wins           Int    @default(0)
+  Player         Player @relation(fields: [playerUsername], references: [username], onDelete: Cascade, map: "PlayerGameStats_ibfk_1")
+
+  @@unique([playerUsername, gameKey], map: "unique_player_game")
+  @@index([gameKey], map: "idx_gameKey")
+  @@index([points], map: "idx_points")
+  @@index([wins], map: "idx_wins")
+}
