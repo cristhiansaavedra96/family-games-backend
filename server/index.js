@@ -590,7 +590,17 @@ io.on('connection', (socket) => {
     if (!room) return;
     let { name, avatarUrl, username } = player || {};
     let avatarId = null;
-    
+
+    // Eliminar cualquier jugador anterior con el mismo username
+    if (username) {
+      for (const [sockId, p] of room.players.entries()) {
+        if (p.username && p.username === username) {
+          room.players.delete(sockId);
+          room.playersReady && room.playersReady.delete(sockId);
+        }
+      }
+    }
+
     // 🖼️ Sincronizar avatar desde la base de datos si existe
     try {
       if (username) {
@@ -607,7 +617,7 @@ io.on('connection', (socket) => {
     } catch (e) {
       console.warn('Error ensuring player in joinRoom:', e);
     }
-    
+
     room.players.set(socket.id, { name, avatarUrl, avatarId, username, cards: [], joinedAt: Date.now() });
     if (!room.hostId) room.hostId = socket.id;
     socket.join(room.id);
