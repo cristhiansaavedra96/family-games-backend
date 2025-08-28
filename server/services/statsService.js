@@ -10,7 +10,7 @@ const pointsMap = {
   column: 1, 
   row: 1, 
   diagonal: 1, 
-  corners: 2, 
+  corners: 1, 
   border: 3, 
   full: 5 
 };

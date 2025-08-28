@@ -530,6 +530,33 @@ function checkAllPlayersReady(room) {
   }
 }
 
+// 🔧 NUEVA FUNCIÓN: Limpieza automática de salas huérfanas
+function automaticRoomCleanup() {
+  let cleanedCount = 0;
+  for (const [roomId, room] of rooms.entries()) {
+    const shouldDelete = (
+      room.players.size === 0 || // Sala sin jugadores
+      (room.started && room.players.size === 0) // Sala en juego pero sin jugadores
+    );
+    
+    if (shouldDelete) {
+      console.log(`[AutoCleanup] Eliminando sala huérfana ${roomId} - Estado: iniciada=${room.started}, jugadores=${room.players.size}`);
+      stopTimer(room);
+      if (room.announceTimeout) clearTimeout(room.announceTimeout);
+      rooms.delete(roomId);
+      cleanedCount++;
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`[AutoCleanup] Limpieza automática completada: ${cleanedCount} salas eliminadas`);
+    broadcastRoomsList();
+  }
+}
+
+// Ejecutar limpieza automática cada 5 minutos
+setInterval(automaticRoomCleanup, 5 * 60 * 1000); // 5 minutos
+
 io.on('connection', (socket) => {
   // Listado inicial de salas
   socket.emit('rooms', getRoomsList());
@@ -542,10 +569,17 @@ io.on('connection', (socket) => {
     // Limpiar salas vacías o inactivas
     let cleanedCount = 0;
     for (const [roomId, room] of rooms.entries()) {
-      if (room.players.size === 0 || (!room.started && room.players.size === 0)) {
+      const shouldDelete = (
+        room.players.size === 0 || // Sala completamente vacía
+        (!room.started && room.players.size === 0) || // Sala no iniciada y vacía
+        (room.started && room.players.size === 0) // 🔧 NUEVO: Sala iniciada pero sin jugadores
+      );
+      
+      if (shouldDelete) {
         // Limpiar timers si existen
         if (room.timer) clearInterval(room.timer);
         if (room.announceTimeout) clearTimeout(room.announceTimeout);
+        console.log(`Eliminando sala ${roomId} - Estado: iniciada=${room.started}, jugadores=${room.players.size}`);
         rooms.delete(roomId);
         cleanedCount++;
       }
@@ -681,7 +715,7 @@ io.on('connection', (socket) => {
   socket.on('setSpeed', ({ roomId, speed }) => {
     const room = rooms.get(roomId || socket.data.roomId);
     if (!room || socket.id !== room.hostId) return;
-    const allowed = [0.5, 1, 1.5, 2];
+    const allowed = [0.5, 0.75, 1, 1.25, 1.5];
     const s = Number(speed);
     if (!allowed.includes(s)) return;
     room.speed = s;
@@ -1001,8 +1035,10 @@ io.on('connection', (socket) => {
     // Si era el anfitrión, transferir anfitrionazgo o eliminar sala
     if (socket.id === room.hostId) {
       if (room.players.size === 0) {
-        // No hay más jugadores, eliminar la sala
+        // No hay más jugadores, eliminar la sala (aunque esté en juego)
+        console.log(`Eliminando sala ${roomId} por falta de jugadores (era del host)`);
         stopTimer(room);
+        if (room.announceTimeout) clearTimeout(room.announceTimeout);
         rooms.delete(roomId);
         broadcastRoomsList();
         return;
@@ -1010,6 +1046,16 @@ io.on('connection', (socket) => {
         // Transferir anfitrionazgo al jugador más antiguo
         room.hostId = getOldestPlayer(room);
       }
+    }
+    
+    // 🔧 NUEVO: Si no hay jugadores restantes, eliminar sala aunque no sea el host
+    if (room.players.size === 0) {
+      console.log(`Eliminando sala ${roomId} por falta de jugadores (último jugador se desconectó)`);
+      stopTimer(room);
+      if (room.announceTimeout) clearTimeout(room.announceTimeout);
+      rooms.delete(roomId);
+      broadcastRoomsList();
+      return;
     }
     
     broadcastRoomState(roomId);
