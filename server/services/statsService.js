@@ -117,7 +117,7 @@ const statsService = {
   async getPlayerStats(username, gameKey = 'bingo') {
     const stats = await prisma.playerGameStats.findUnique({
       where: { playerUsername_gameKey: { playerUsername: username, gameKey } },
-      include: { player: true }
+  include: { Player: true }
     });
     
     if (!stats) {
@@ -137,9 +137,9 @@ const statsService = {
     
     return {
       username: stats.playerUsername,
-      name: stats.player?.name,
-      avatarUrl: stats.player?.avatarUrl,
-      avatarId: stats.player?.avatarId,
+      name: stats.Player?.name,
+      avatarUrl: stats.Player?.avatarUrl,
+      avatarId: stats.Player?.avatarId,
       totalGames: stats.totalGames || 0,
       wins: stats.wins || 0,
       points: stats.points || 0,
@@ -156,20 +156,20 @@ const statsService = {
         { totalGames: 'asc' }
       ],
       take: limit,
-      include: { player: true },
+  include: { Player: true },
     });
     
     return stats.map((s, index) => ({
       rank: index + 1,
       username: s.playerUsername,
-      name: s.player?.name || s.playerUsername,
-      avatarUrl: s.player?.avatarUrl,
-      avatarId: s.player?.avatarId,
+      name: s.Player?.name || s.playerUsername,
+      avatarUrl: s.Player?.avatarUrl,
+      avatarId: s.Player?.avatarId,
       points: s.points || 0,
       wins: s.wins || 0,
       totalGames: s.totalGames || 0,
       winRate: s.totalGames > 0 ? ((s.wins || 0) / s.totalGames * 100).toFixed(1) : 0,
-      updatedAt: s.player?.updatedAt
+      updatedAt: s.Player?.updatedAt
     }));
   },
 
@@ -242,15 +242,15 @@ const statsService = {
       },
       orderBy: [orderBy, { totalGames: 'desc' }],
       take: limit,
-      include: { player: true },
+  include: { Player: true },
     });
-    
+    console.log('[getTopPlayers] Resultados de la consulta playerGameStats:', stats);
     return stats.map((s, index) => ({
       rank: index + 1,
       username: s.playerUsername,
-      name: s.player?.name || s.playerUsername,
-      avatarUrl: s.player?.avatarUrl,
-      avatarId: s.player?.avatarId,
+      name: s.Player?.name || s.playerUsername,
+      avatarUrl: s.Player?.avatarUrl,
+      avatarId: s.Player?.avatarId,
       points: s.points || 0,
       wins: s.wins || 0,
       totalGames: s.totalGames || 0,

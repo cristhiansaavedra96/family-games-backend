@@ -844,9 +844,12 @@ io.on('connection', (socket) => {
   });
 
   // Nuevos endpoints para rankings y búsqueda
-  socket.on('getTopPlayers', async ({ gameKey, criteria, limit }, cb) => {
+  socket.on('getTopPlayers', async (params, cb) => {
+    console.log('[getTopPlayers] Solicitud recibida:', params);
     try {
+      const { gameKey, criteria, limit } = params || {};
       const topPlayers = await statsService.getTopPlayers(gameKey || 'bingo', criteria || 'points', limit || 10);
+      console.log('[getTopPlayers] Respuesta enviada:', topPlayers);
       if (typeof cb === 'function') cb({ ok: true, topPlayers });
     } catch (e) {
       console.error('Error getting top players:', e);
