@@ -1,14 +1,34 @@
-// Servidor Node.js + Socket.IO - Sala única, sorteo auto 1s/0.5s, voz manejada en frontend
+// Servidor Node.js + Socket.IO - Refactorizado con RoomsManager y GameHandlers
 const express = require("express");
-const sharp = require("sharp");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const dotenv = require("dotenv");
-const { shuffleBag, generateCard, checkFigures } = require("./games/bingo");
-const { getDataStore } = require("./core/datastore");
-const statsService = require("./services/statsService");
-const dataStore = getDataStore();
+const RoomsManager = require("./core/RoomsManager");
+const GameHandlerFactory = require("./games/GameHandlerFactory");
+const {
+  createUpdateProfileHandler,
+  createCompressAllAvatarsHandler,
+} = require("./shared/playerManager");
+const {
+  createGetStatsHandler,
+  createGetLeaderboardHandler,
+  createGetTopPlayersHandler,
+  createSearchPlayersHandler,
+} = require("./shared/statsHandler");
+const {
+  createGetAvatarHandler,
+  createGetAvatarByIdHandler,
+  createSyncAvatarsHandler,
+  createCheckAvatarsHandler,
+} = require("./shared/avatarHandler");
+const {
+  createRoomHandlers,
+  createGameFlowHandlers,
+  createStatsHandlers,
+  createChatHandlers,
+  createDisconnectHandler,
+} = require("./shared/socketHandlers");
 
 dotenv.config();
 
@@ -21,641 +41,120 @@ app.use(cors({ origin: ORIGIN }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: ORIGIN } });
 
-// Soporte de múltiples salas
-const rooms = new Map(); // roomId -> state
-let roomCounter = 1;
+// Gestor de salas y manejadores de juegos
+const roomsManager = new RoomsManager();
+const gameHandlers = new Map(); // roomId -> GameHandler instance
 
-async function compressAvatar(base64Avatar, targetSizeKB = 50) {
-  try {
+// Función para obtener o crear un game handler
+function getGameHandler(roomId) {
+  let handler = gameHandlers.get(roomId);
+  if (!handler) {
+    const room = roomsManager.getRoom(roomId);
+    if (room) {
+      handler = GameHandlerFactory.createHandler(room.gameKey, room, io);
+      gameHandlers.set(roomId, handler);
+    }
+  }
+  return handler;
+}
+
+// Función para limpiar game handler cuando se elimina una sala
+function cleanupGameHandler(roomId) {
+  const handler = gameHandlers.get(roomId);
+  if (handler && typeof handler.cleanup === "function") {
+    handler.cleanup();
+  }
+  gameHandlers.delete(roomId);
+}
+
+// Función para asegurar que un jugador solo esté en una sala
+function ensurePlayerInSingleRoom(socket, targetRoomId = null) {
+  const currentRoom = roomsManager.findPlayerRoom(socket.id);
+
+  if (currentRoom && currentRoom.id !== targetRoomId) {
     console.log(
-      `🔧 Comprimiendo avatar original: ${(base64Avatar.length / 1024).toFixed(
-        1
-      )}KB`
+      `🔄 Jugador ${socket.id} saliendo automáticamente de sala ${currentRoom.id}`
     );
 
-    // Separar el prefijo data:image del base64 puro
-    const matches = base64Avatar.match(/^data:image\/([^;]+);base64,(.+)$/);
-    if (!matches) {
-      throw new Error("Formato de imagen base64 inválido");
+    // Remover de la sala actual
+    const result = roomsManager.removePlayerFromRoom(currentRoom.id, socket.id);
+    socket.leave(currentRoom.id);
+
+    // Limpiar game handler si la sala debe eliminarse
+    if (result && result.shouldDelete) {
+      cleanupGameHandler(currentRoom.id);
+      roomsManager.deleteRoom(currentRoom.id);
+    } else if (result) {
+      // Notificar cambios en la sala
+      broadcastRoomState(currentRoom.id);
     }
 
-    const [, originalFormat, base64Data] = matches;
-    console.log(`   - Formato original: ${originalFormat}`);
-
-    // Convertir base64 a buffer
-    const inputBuffer = Buffer.from(base64Data, "base64");
-
-    // Configuración inicial de compresión
-    let quality = 85;
-    let width = 200;
-    let height = 200;
-    let compressed;
-    let attempts = 0;
-    const maxAttempts = 5;
-
-    do {
-      attempts++;
-      console.log(
-        `   - Intento ${attempts}: calidad=${quality}%, dimensiones=${width}x${height}`
-      );
-
-      // Comprimir imagen
-      compressed = await sharp(inputBuffer)
-        .resize(width, height, {
-          fit: "cover",
-          position: "center",
-        })
-        .jpeg({
-          quality,
-          progressive: true,
-          mozjpeg: true, // Mejor compresión
-        })
-        .toBuffer();
-
-      const compressedSizeKB = compressed.length / 1024;
-      console.log(`   - Resultado: ${compressedSizeKB.toFixed(1)}KB`);
-
-      // Si ya está dentro del tamaño objetivo, salir
-      if (compressedSizeKB <= targetSizeKB || attempts >= maxAttempts) {
-        break;
-      }
-
-      // Ajustar parámetros para siguiente intento
-      if (compressedSizeKB > targetSizeKB * 1.5) {
-        // Muy grande, reducir agresivamente
-        quality = Math.max(quality - 20, 30);
-        width = Math.max(width - 20, 100);
-        height = Math.max(height - 20, 100);
-      } else {
-        // Casi en tamaño, ajuste fino
-        quality = Math.max(quality - 10, 40);
-      }
-    } while (attempts < maxAttempts);
-
-    // Convertir de vuelta a base64
-    const compressedBase64 = `data:image/jpeg;base64,${compressed.toString(
-      "base64"
-    )}`;
-
-    const finalSizeKB = compressedBase64.length / 1024;
-    const reductionPercent = (
-      ((base64Avatar.length - compressedBase64.length) / base64Avatar.length) *
-      100
-    ).toFixed(1);
-
-    console.log(`✅ Compresión completada:`);
-    console.log(`   - Tamaño final: ${finalSizeKB.toFixed(1)}KB`);
-    console.log(`   - Reducción: ${reductionPercent}%`);
-    console.log(`   - Intentos: ${attempts}`);
-
-    return compressedBase64;
-  } catch (error) {
-    console.error("❌ Error comprimiendo avatar:", error);
-    // En caso de error, retornar el original si no es demasiado grande
-    if (base64Avatar.length <= 200 * 1024) {
-      // 200KB máximo para fallback
-      console.log("⚠️ Usando avatar original sin comprimir como fallback");
-      return base64Avatar;
-    } else {
-      throw new Error("Avatar demasiado grande y falló la compresión");
+    // Limpiar el roomId del socket si no va a otra sala
+    if (!targetRoomId) {
+      socket.data.roomId = null;
     }
-  }
-}
 
-// Función para encontrar el número de sala más bajo disponible
-function getAvailableRoomNumber() {
-  let roomNumber = 1;
-  while (true) {
-    const roomId = String(roomNumber);
-    if (!rooms.has(roomId)) {
-      return roomNumber;
-    }
-    roomNumber++;
-  }
-}
+    // Actualizar lista de salas
+    broadcastRoomsList();
 
-// Función para encontrar el jugador más antiguo (por joinedAt)
-function getOldestPlayer(room) {
-  if (room.players.size === 0) return null;
-
-  let oldestPlayerId = null;
-  let oldestJoinTime = Infinity;
-
-  for (const [playerId, playerData] of room.players) {
-    if (playerData.joinedAt < oldestJoinTime) {
-      oldestJoinTime = playerData.joinedAt;
-      oldestPlayerId = playerId;
-    }
+    return currentRoom;
   }
 
-  return oldestPlayerId;
-}
-
-function createRoom() {
-  const roomNumber = getAvailableRoomNumber();
-  const id = String(roomNumber);
-  const room = {
-    id,
-    name: `Sala ${roomNumber}`,
-    gameKey: "bingo", // preparado para múltiples juegos
-    started: false,
-    paused: true,
-    speed: 1, // multiplicador x0.5..x2
-    cardsPerPlayer: 1, // Siempre inicializar en 1
-    players: new Map(), // socketId -> { name, avatarUrl, avatarId, username, cards: number[][] }
-    hostId: null,
-    bag: [],
-    drawn: [],
-    timer: null,
-    announceTimeout: null,
-    figuresClaimed: {
-      // Cambio a estructura más detallada: figura -> { playerId, cardIndex, details }
-      corners: null,
-      row: null,
-      column: null,
-      diagonal: null,
-      border: null,
-      full: null,
-    },
-    // Nueva estructura para figuras específicas por jugador y cartón
-    specificClaims: new Map(), // "playerId:cardIndex:figure" -> { playerId, cardIndex, figure, details }
-    // Rastreo de figuras completadas por jugador para estadísticas finales
-    playerFigures: new Map(), // playerId -> Set(['column', 'row', 'diagonal'])
-    // Nuevos campos para sistema de nueva partida
-    gameEnded: false,
-    playersReady: new Set(), // Set de socketIds listos para nueva partida
-    announcementQueue: [], // Cola de anuncios individuales
-    processingAnnouncements: false,
-  };
-  rooms.set(id, room);
-  return room;
-}
-
-function getRoomsList() {
-  return Array.from(rooms.values()).map((r) => ({
-    id: r.id,
-    name: r.name,
-    players: Array.from(r.players.entries()).map(([sid, p]) => ({
-      id: sid,
-      name: p.name,
-      avatarId: p.avatarId, // Solo enviar avatarId para caché eficiente
-      username: p.username,
-    })),
-    started: r.started,
-    hostId: r.hostId,
-    cardsPerPlayer: r.cardsPerPlayer || 1,
-  }));
+  return null;
 }
 
 function broadcastRoomsList() {
-  io.emit("rooms", getRoomsList());
+  io.emit("rooms", roomsManager.getRoomsList(gameHandlers));
 }
 
 function broadcastRoomState(roomId) {
-  const room = rooms.get(roomId);
+  const room = roomsManager.getRoom(roomId);
   if (!room) return;
+
   const publicPlayers = Array.from(room.players.entries()).map(([sid, p]) => ({
     id: sid,
     name: p.name,
     avatarUrl: p.avatarUrl,
-    avatarId: p.avatarId, // ✅ Incluir avatarId
+    avatarId: p.avatarId,
     username: p.username,
     cards: p.cards,
   }));
-  io.to(roomId).emit("state", {
+
+  // Obtener el estado específico del juego
+  const gameHandler = getGameHandler(roomId);
+  const gameState = gameHandler ? gameHandler.getPublicState() : {};
+  const fullConfig = gameHandler ? gameHandler.getFullConfig() : room.config;
+
+  console.log(
+    `📡 [Backend] Broadcasting room state - Room: ${roomId}, GameKey: ${
+      room.gameKey
+    }, GameHandler exists: ${!!gameHandler}`
+  );
+  if (gameHandler && room.gameKey === "truco") {
+    console.log(
+      `🎯 [Backend] Truco game state keys: ${Object.keys(gameState).join(", ")}`
+    );
+  }
+
+  const stateToSend = {
     roomId,
     name: room.name,
     gameKey: room.gameKey,
-    started: room.started,
-    paused: room.paused,
-    speed: room.speed,
-    cardsPerPlayer: room.cardsPerPlayer,
     hostId: room.hostId,
     players: publicPlayers,
-    drawn: room.drawn,
-    lastBall: room.drawn[room.drawn.length - 1] || null,
-    figuresClaimed: room.figuresClaimed,
-    specificClaims: Object.fromEntries(room.specificClaims), // Convertir Map a Object para JSON
     gameEnded: room.gameEnded,
     playersReady: Array.from(room.playersReady),
-  });
-}
-
-function stopTimer(room) {
-  if (room.timer) {
-    clearInterval(room.timer);
-    room.timer = null;
-  }
-}
-function startTimerIfNeeded(room) {
-  if (!room.started || room.paused || room.timer) return;
-  const baseMs = 10000;
-  const factor = Number(room.speed) || 1;
-  const intervalMs = Math.max(500, Math.round(baseMs / factor));
-  room.timer = setInterval(() => drawNextBall(room), intervalMs);
-}
-
-function drawNextBall(room) {
-  if (!room.started || room.paused) return;
-  const n = room.bag.pop();
-  if (n == null) return;
-  room.drawn.push(n);
-  io.to(room.id).emit("ball", n);
-  broadcastRoomState(room.id);
-}
-
-function startGame(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  room.started = true;
-  room.paused = false;
-  room.gameEnded = false;
-  room.playersReady.clear();
-  room.announcementQueue = [];
-  room.processingAnnouncements = false;
-  // reiniciar velocidad por si quedó algo previo
-  room.speed = room.speed || 1;
-  room.bag = shuffleBag();
-  room.drawn = [];
-  room.figuresClaimed = {
-    corners: null,
-    row: null,
-    column: null,
-    diagonal: null,
-    border: null,
-    full: null,
+    // Configuración completa (sala + juego específico)
+    ...fullConfig,
+    // Estado del juego (debe tener prioridad)
+    ...gameState,
   };
-  room.playerFigures.clear(); // Limpiar figuras rastreadas del juego anterior
-  for (const p of room.players.values()) {
-    p.cards = Array.from({ length: room.cardsPerPlayer }, () => generateCard());
-  }
-  broadcastRoomState(roomId);
-  stopTimer(room);
-  startTimerIfNeeded(room);
-}
 
-// Procesar cola de anuncios individuales
-function processAnnouncementQueue(room) {
-  if (room.processingAnnouncements || room.announcementQueue.length === 0)
-    return;
+  console.log(
+    `📡 [Backend] Final state to send - currentPlayerSocketId: ${stateToSend.currentPlayerSocketId}, gamePhase: ${stateToSend.gamePhase}`
+  );
 
-  room.processingAnnouncements = true;
-  const announcement = room.announcementQueue.shift();
-
-  // Pausar el juego durante el anuncio
-  room.paused = true;
-  stopTimer(room);
-
-  // Enviar anuncio individual
-  io.to(room.id).emit("announcement", announcement);
-
-  // Programar siguiente anuncio o reanudar juego
-  setTimeout(() => {
-    room.processingAnnouncements = false;
-
-    if (room.announcementQueue.length > 0) {
-      // Continuar con el siguiente anuncio
-      processAnnouncementQueue(room);
-    } else {
-      // No hay más anuncios, reanudar juego si no terminó
-      if (!room.gameEnded) {
-        room.paused = false;
-        startTimerIfNeeded(room);
-        broadcastRoomState(room.id);
-      }
-    }
-  }, 2500); // 2.5 segundos por anuncio
-}
-
-function validateAndFlags(roomId, socketId, cardIndex, markedFromClient) {
-  const room = rooms.get(roomId);
-  if (!room) return { ok: false, reason: "room_not_found" };
-  const player = room.players.get(socketId);
-  if (!player) return { ok: false, reason: "player_not_found" };
-  const card = player.cards?.[cardIndex];
-  if (!card) return { ok: false, reason: "card_not_found" };
-  // Validar matriz marcada enviada: sólo permite marcar números ya cantados o centro libre
-  let marked = markedFromClient;
-  if (
-    !Array.isArray(marked) ||
-    marked.length !== 5 ||
-    marked.some((row) => !Array.isArray(row) || row.length !== 5)
-  ) {
-    return { ok: false, reason: "invalid_marked" };
-  }
-  const drawnSet = new Set(room.drawn);
-  for (let r = 0; r < 5; r++) {
-    for (let c = 0; c < 5; c++) {
-      const isCenter = r === 2 && c === 2;
-      if (isCenter) {
-        // centro siempre puede estar marcado
-        if (!marked[r][c]) marked[r][c] = true;
-        continue;
-      }
-      if (marked[r][c]) {
-        const value = card[r][c];
-        if (!drawnSet.has(value)) {
-          return { ok: false, reason: "marked_not_drawn" };
-        }
-      }
-    }
-  }
-  const flags = checkFigures(marked);
-  return { ok: true, flags };
-}
-
-// Construye detalles de la figura para resaltar celdas exactas
-function buildClaimDetails(figure, marked) {
-  const details = {};
-  if (!marked) return details;
-  switch (figure) {
-    case "row": {
-      for (let r = 0; r < 5; r++) {
-        if (marked[r].every(Boolean)) {
-          details.row = r;
-          break;
-        }
-      }
-      break;
-    }
-    case "column": {
-      for (let c = 0; c < 5; c++) {
-        if ([0, 1, 2, 3, 4].every((i) => marked[i][c])) {
-          details.column = c;
-          break;
-        }
-      }
-      break;
-    }
-    case "diagonal": {
-      const d1 = [0, 1, 2, 3, 4].every((i) => marked[i][i]);
-      const d2 = [0, 1, 2, 3, 4].every((i) => marked[i][4 - i]);
-      if (d1) details.diagonal = 0;
-      else if (d2) details.diagonal = 1;
-      break;
-    }
-    case "border": {
-      details.border = true;
-      break;
-    }
-    case "corners": {
-      details.corners = true;
-      break;
-    }
-    case "full": {
-      details.full = true;
-      break;
-    }
-  }
-  return details;
-}
-
-async function checkClaim(
-  roomId,
-  socketId,
-  figure,
-  cardIndex,
-  markedFromClient
-) {
-  const room = rooms.get(roomId);
-  if (!room) return { ok: false, reason: "room_not_found" };
-  if (room.figuresClaimed[figure]) return { ok: false, reason: "figure_taken" };
-  const valid = validateAndFlags(roomId, socketId, cardIndex, markedFromClient);
-  if (!valid.ok) return valid;
-  const { flags } = valid;
-  if (!flags[figure]) return { ok: false, reason: "invalid" };
-  room.figuresClaimed[figure] = socketId;
-
-  // Rastrear figura completada por jugador (para stats finales)
-  try {
-    const player = rooms.get(roomId)?.players.get(socketId);
-    const pid = player?.username || socketId;
-
-    if (!room.playerFigures.has(pid)) {
-      room.playerFigures.set(pid, new Set());
-    }
-    room.playerFigures.get(pid).add(figure);
-
-    console.log(`Player ${pid} completed figure: ${figure}`);
-  } catch (e) {
-    console.error("Error tracking player figure:", e);
-  }
-  // Registrar reclamo específico con detalles
-  try {
-    const details = buildClaimDetails(figure, markedFromClient);
-    const claimKey = `${socketId}:${cardIndex}:${figure}`;
-    const player = rooms.get(roomId)?.players.get(socketId) || {};
-    rooms.get(roomId).specificClaims.set(claimKey, {
-      playerId: socketId,
-      cardIndex,
-      figure,
-      details,
-      playerName: player.name,
-      timestamp: Date.now(),
-    });
-    // Encolar anuncio individual y procesar cola (pausar durante anuncios)
-    room.announcementQueue.push({
-      roomId,
-      playerId: socketId,
-      playerName: player.name,
-      playerUsername: player.username,
-      playerAvatarId: player.avatarId, // Enviar avatarId en lugar de avatarUrl completo
-      figures: [figure],
-      cardIndex,
-    });
-  } catch (e) {
-    console.warn("Failed to build claim details (manual):", e);
-  }
-  broadcastRoomState(roomId);
-  // Procesar cola de anuncios (pausa y reanuda automáticamente cuando termine)
-  processAnnouncementQueue(room);
-  if (figure === "full") {
-    room.gameEnded = true;
-    stopTimer(room);
-    // Enviar gameOver después de que terminen los anuncios en cola
-    const pending = room.announcementQueue.length;
-    setTimeout(() => {
-      // Stats: resultado de juego con figuras completadas
-      try {
-        const winner = room.players.get(socketId);
-        const winnerId = winner?.username || socketId;
-
-        // Convertir playerFigures Map a objeto con arrays
-        const playersWithFigures = {};
-        for (const [playerId, figuresSet] of room.playerFigures.entries()) {
-          playersWithFigures[playerId] = Array.from(figuresSet);
-        }
-
-        // Registrar en dataStore (memoria)
-        dataStore.recordGameResult({
-          gameKey: room.gameKey,
-          roomId,
-          winnerId,
-          playersWithFigures,
-        });
-
-        // Registrar en base de datos
-        statsService.recordGameResult({
-          gameKey: room.gameKey,
-          roomId,
-          winnerId,
-          playersWithFigures,
-        });
-
-        console.log("Game result recorded (full):", {
-          winnerId,
-          playersWithFigures,
-        });
-      } catch (e) {
-        console.error("Error recording game result:", e);
-      }
-      io.to(roomId).emit("gameOver", {
-        roomId,
-        winner: socketId,
-        figuresClaimed: room.figuresClaimed,
-        players: Array.from(room.players.entries()).map(([sid, p]) => ({
-          id: sid,
-          name: p.name,
-          avatarUrl: p.avatarUrl,
-        })),
-      });
-    }, pending * 2500 + 1000);
-  }
-  return { ok: true };
-}
-
-function autoClaim(roomId, socketId, cardIndex, markedFromClient) {
-  const room = rooms.get(roomId);
-  if (!room) return { ok: false, reason: "room_not_found" };
-  const valid = validateAndFlags(roomId, socketId, cardIndex, markedFromClient);
-  if (!valid.ok) return valid;
-  const { flags } = valid;
-
-  // Obtener información del jugador
-  const player = room.players.get(socketId) || {};
-
-  const newly = Object.keys(room.figuresClaimed)
-    .filter((k) => !room.figuresClaimed[k])
-    .filter((k) => flags[k]);
-  if (newly.length === 0) return { ok: false, reason: "no_new_figures" };
-
-  // Marcar figuras como completadas y registrar reclamaciones específicas
-  for (const f of newly) {
-    room.figuresClaimed[f] = socketId;
-
-    // Registrar reclamación específica
-    const claimKey = `${socketId}:${cardIndex}:${f}`;
-    const details = buildClaimDetails(f, markedFromClient);
-    room.specificClaims.set(claimKey, {
-      playerId: socketId,
-      cardIndex: cardIndex,
-      figure: f,
-      details,
-      playerName: player.name,
-      timestamp: Date.now(),
-    });
-
-    // Rastrear figura completada por jugador (para stats finales)
-    try {
-      const pid = player?.username || socketId;
-      if (!room.playerFigures.has(pid)) {
-        room.playerFigures.set(pid, new Set());
-      }
-      room.playerFigures.get(pid).add(f);
-      console.log(`Player ${pid} completed figure: ${f}`);
-    } catch (e) {
-      console.error("Error tracking player figure:", e);
-    }
-  }
-
-  // Crear anuncios individuales por prioridad
-  const priorityOrder = [
-    "full",
-    "border",
-    "diagonal",
-    "corners",
-    "column",
-    "row",
-  ];
-  const sortedFigures = newly.sort((a, b) => {
-    return priorityOrder.indexOf(a) - priorityOrder.indexOf(b);
-  });
-
-  // Agregar anuncios individuales a la cola
-  sortedFigures.forEach((figure) => {
-    room.announcementQueue.push({
-      roomId,
-      playerId: socketId,
-      playerName: player.name,
-      playerUsername: player.username,
-      playerAvatarId: player.avatarId, // Enviar avatarId en lugar de avatarUrl completo
-      figures: [figure], // Solo una figura por anuncio
-      cardIndex,
-    });
-  });
-
-  // Verificar si el juego terminó
-  if (newly.includes("full")) {
-    room.gameEnded = true;
-    stopTimer(room);
-  }
-
-  broadcastRoomState(roomId);
-
-  // Procesar cola de anuncios
-  processAnnouncementQueue(room);
-
-  // Si terminó el juego, enviar gameOver después de los anuncios
-  if (newly.includes("full")) {
-    setTimeout(() => {
-      // Stats: resultado de juego con figuras completadas
-      try {
-        const winner = room.players.get(socketId);
-        const winnerId = winner?.username || socketId;
-
-        // Convertir playerFigures Map a objeto con arrays
-        const playersWithFigures = {};
-        for (const [playerId, figuresSet] of room.playerFigures.entries()) {
-          playersWithFigures[playerId] = Array.from(figuresSet);
-        }
-
-        // Registrar en dataStore (memoria)
-        dataStore.recordGameResult({
-          gameKey: room.gameKey,
-          roomId,
-          winnerId,
-          playersWithFigures,
-        });
-
-        // Registrar en base de datos
-        statsService.recordGameResult({
-          gameKey: room.gameKey,
-          roomId,
-          winnerId,
-          playersWithFigures,
-        });
-
-        console.log("Game result recorded (multiple):", {
-          winnerId,
-          playersWithFigures,
-        });
-      } catch (e) {
-        console.error("Error recording game result:", e);
-      }
-      io.to(roomId).emit("gameOver", {
-        roomId,
-        winner: socketId,
-        figuresClaimed: room.figuresClaimed,
-        players: Array.from(room.players.entries()).map(([sid, p]) => ({
-          id: sid,
-          name: p.name,
-          avatarUrl: p.avatarUrl,
-        })),
-      });
-    }, sortedFigures.length * 2500 + 1000); // Esperar a que terminen todos los anuncios
-  }
-
-  return { ok: true, figures: newly };
+  io.to(roomId).emit("state", stateToSend);
 }
 
 // Verificar si todos los jugadores están listos para nueva partida
@@ -666,34 +165,28 @@ function checkAllPlayersReady(room) {
   if (totalPlayers > 0 && readyPlayers === totalPlayers) {
     // Todos están listos, iniciar nueva partida
     setTimeout(() => {
-      startGame(room.id);
+      const gameHandler = getGameHandler(room.id);
+      if (gameHandler) {
+        gameHandler.startGame();
+        broadcastRoomState(room.id);
+      }
     }, 1000);
   }
 }
 
 // 🔧 NUEVA FUNCIÓN: Limpieza automática de salas huérfanas
 function automaticRoomCleanup() {
-  let cleanedCount = 0;
-  for (const [roomId, room] of rooms.entries()) {
-    const shouldDelete =
-      room.players.size === 0 || // Sala sin jugadores
-      (room.started && room.players.size === 0); // Sala en juego pero sin jugadores
-
-    if (shouldDelete) {
-      console.log(
-        `[AutoCleanup] Eliminando sala huérfana ${roomId} - Estado: iniciada=${room.started}, jugadores=${room.players.size}`
-      );
-      stopTimer(room);
-      if (room.announceTimeout) clearTimeout(room.announceTimeout);
-      rooms.delete(roomId);
-      cleanedCount++;
-    }
-  }
-
+  const cleanedCount = roomsManager.cleanupEmptyRooms();
   if (cleanedCount > 0) {
     console.log(
       `[AutoCleanup] Limpieza automática completada: ${cleanedCount} salas eliminadas`
     );
+    // Limpiar game handlers huérfanos
+    for (const roomId of gameHandlers.keys()) {
+      if (!roomsManager.getRoom(roomId)) {
+        cleanupGameHandler(roomId);
+      }
+    }
     broadcastRoomsList();
   }
 }
@@ -701,802 +194,118 @@ function automaticRoomCleanup() {
 // Ejecutar limpieza automática cada 5 minutos
 setInterval(automaticRoomCleanup, 5 * 60 * 1000); // 5 minutos
 
+// Crear handlers para gestión de jugadores usando las funciones modulares
+const updateProfileHandler = createUpdateProfileHandler(
+  roomsManager,
+  broadcastRoomState
+);
+const compressAllAvatarsHandler = createCompressAllAvatarsHandler();
+
+// Crear handlers para estadísticas y rankings
+const getStatsHandler = createGetStatsHandler(roomsManager);
+const getLeaderboardHandler = createGetLeaderboardHandler();
+const getTopPlayersHandler = createGetTopPlayersHandler();
+const searchPlayersHandler = createSearchPlayersHandler();
+const getAvatarHandler = createGetAvatarHandler();
+const getAvatarByIdHandler = createGetAvatarByIdHandler();
+const syncAvatarsHandler = createSyncAvatarsHandler();
+const checkAvatarsHandler = createCheckAvatarsHandler();
+
+// Crear handlers Socket.IO organizados por categorías
+const roomHandlers = createRoomHandlers({
+  roomsManager,
+  gameHandlers,
+  getGameHandler,
+  cleanupGameHandler,
+  ensurePlayerInSingleRoom,
+  broadcastRoomState,
+  broadcastRoomsList,
+  checkAllPlayersReady,
+  io,
+});
+
+const gameFlowHandlers = createGameFlowHandlers({
+  roomsManager,
+  getGameHandler,
+  broadcastRoomState,
+  broadcastRoomsList,
+});
+
+const statsHandlers = createStatsHandlers({
+  getStatsHandler,
+  getLeaderboardHandler,
+  getTopPlayersHandler,
+  searchPlayersHandler,
+  getAvatarHandler,
+  getAvatarByIdHandler,
+  syncAvatarsHandler,
+  checkAvatarsHandler,
+  updateProfileHandler,
+  compressAllAvatarsHandler,
+});
+
+const chatHandlers = createChatHandlers({
+  roomsManager,
+  io,
+});
+
+const disconnectHandler = createDisconnectHandler({
+  roomsManager,
+  cleanupGameHandler,
+  broadcastRoomState,
+  broadcastRoomsList,
+});
+
 io.on("connection", (socket) => {
   // Listado inicial de salas
-  socket.emit("rooms", getRoomsList());
-
-  socket.on("listRooms", () => {
-    socket.emit("rooms", getRoomsList());
-  });
-
-  socket.on("cleanupRooms", () => {
-    // Limpiar salas vacías o inactivas
-    let cleanedCount = 0;
-    for (const [roomId, room] of rooms.entries()) {
-      const shouldDelete =
-        room.players.size === 0 || // Sala completamente vacía
-        (!room.started && room.players.size === 0) || // Sala no iniciada y vacía
-        (room.started && room.players.size === 0); // 🔧 NUEVO: Sala iniciada pero sin jugadores
-
-      if (shouldDelete) {
-        // Limpiar timers si existen
-        if (room.timer) clearInterval(room.timer);
-        if (room.announceTimeout) clearTimeout(room.announceTimeout);
-        console.log(
-          `Eliminando sala ${roomId} - Estado: iniciada=${room.started}, jugadores=${room.players.size}`
-        );
-        rooms.delete(roomId);
-        cleanedCount++;
-      }
-    }
-    console.log(`Limpieza completada: ${cleanedCount} salas eliminadas`);
-    broadcastRoomsList();
-  });
-
-  socket.on("createRoom", async ({ player, cardsPerPlayer }) => {
-    const room = createRoom();
-    let { name, avatarUrl, username } = player || {};
-    let avatarId = null;
-
-    // 🖼️ Sincronizar avatar desde la base de datos si existe
-    try {
-      if (username) {
-        const existingPlayer = await statsService.getPlayerByUsername(username);
-        if (existingPlayer && existingPlayer.avatarUrl) {
-          console.log(
-            `🔄 Avatar sincronizado para ${username}: ${existingPlayer.avatarId}`
-          );
-          avatarUrl = existingPlayer.avatarUrl;
-          avatarId = existingPlayer.avatarId;
-        }
-        const player = await statsService.ensurePlayer(
-          username,
-          name,
-          avatarUrl
-        );
-        avatarId = player.avatarId;
-      }
-      dataStore.ensurePlayer(username || socket.id, name, avatarUrl);
-    } catch (e) {
-      console.warn("Error ensuring player in createRoom:", e);
-    }
-
-    room.players.set(socket.id, {
-      name,
-      avatarUrl,
-      avatarId,
-      username,
-      cards: [],
-      joinedAt: Date.now(),
-    });
-    room.hostId = socket.id;
-    if (cardsPerPlayer)
-      room.cardsPerPlayer = Math.max(
-        1,
-        Math.min(4, Number(cardsPerPlayer) || 1)
-      );
-    socket.join(room.id);
-    socket.data.roomId = room.id;
-    socket.emit("joined", {
-      id: socket.id,
-      hostId: room.hostId,
-      roomId: room.id,
-    });
-    broadcastRoomState(room.id);
-    broadcastRoomsList();
-  });
-
-  socket.on("joinRoom", async ({ roomId, player }) => {
-    const room = rooms.get(roomId);
-    if (!room) return;
-    let { name, avatarUrl, username } = player || {};
-    let avatarId = null;
-
-    // Eliminar cualquier jugador anterior con el mismo username
-    if (username) {
-      for (const [sockId, p] of room.players.entries()) {
-        if (p.username && p.username === username) {
-          room.players.delete(sockId);
-          room.playersReady && room.playersReady.delete(sockId);
-        }
-      }
-    }
-
-    // 🖼️ Sincronizar avatar desde la base de datos si existe
-    try {
-      if (username) {
-        const existingPlayer = await statsService.getPlayerByUsername(username);
-        if (existingPlayer && existingPlayer.avatarUrl) {
-          console.log(
-            `🔄 Avatar sincronizado para ${username}: ${existingPlayer.avatarId}`
-          );
-          avatarUrl = existingPlayer.avatarUrl;
-          avatarId = existingPlayer.avatarId;
-        }
-        const player = await statsService.ensurePlayer(
-          username,
-          name,
-          avatarUrl
-        );
-        avatarId = player.avatarId;
-      }
-      dataStore.ensurePlayer(username || socket.id, name, avatarUrl);
-    } catch (e) {
-      console.warn("Error ensuring player in joinRoom:", e);
-    }
-
-    room.players.set(socket.id, {
-      name,
-      avatarUrl,
-      avatarId,
-      username,
-      cards: [],
-      joinedAt: Date.now(),
-    });
-    if (!room.hostId) room.hostId = socket.id;
-    socket.join(room.id);
-    socket.data.roomId = room.id;
-    socket.emit("joined", {
-      id: socket.id,
-      hostId: room.hostId,
-      roomId: room.id,
-    });
-    broadcastRoomState(room.id);
-    broadcastRoomsList();
-  });
-
-  socket.on("leaveRoom", () => {
-    const roomId = socket.data.roomId;
-    if (!roomId) return;
-    const room = rooms.get(roomId);
-    if (!room) return;
-
-    // Remover al jugador de la sala
-    room.players.delete(socket.id);
-    room.playersReady.delete(socket.id);
-    socket.leave(roomId);
-    socket.data.roomId = null;
-
-    // Si era el anfitrión, transferir anfitrionazgo o eliminar sala
-    if (socket.id === room.hostId) {
-      if (room.players.size === 0) {
-        // No hay más jugadores, eliminar la sala
-        stopTimer(room);
-        rooms.delete(roomId);
-        broadcastRoomsList();
-        return;
-      } else {
-        // Transferir anfitrionazgo al jugador más antiguo
-        room.hostId = getOldestPlayer(room);
-      }
-    }
-
-    broadcastRoomState(roomId);
-    broadcastRoomsList();
-  });
-
-  // Nuevo evento: Jugador listo para nueva partida
-  socket.on("readyForNewGame", ({ roomId }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || !room.gameEnded) return;
-
-    room.playersReady.add(socket.id);
-    broadcastRoomState(room.id);
-
-    // Verificar si todos están listos
-    checkAllPlayersReady(room);
-  });
-
-  socket.on("configure", ({ roomId, cardsPerPlayer }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || socket.id !== room.hostId || room.started) return;
-    room.cardsPerPlayer = Math.max(1, Math.min(4, Number(cardsPerPlayer) || 1));
-    broadcastRoomState(room.id);
-    broadcastRoomsList();
-  });
-
-  socket.on("setSpeed", ({ roomId, speed }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || socket.id !== room.hostId) return;
-    const allowed = [0.5, 0.75, 1, 1.25, 1.5];
-    const s = Number(speed);
-    if (!allowed.includes(s)) return;
-    room.speed = s;
-    stopTimer(room);
-    startTimerIfNeeded(room);
-    broadcastRoomState(room.id);
-  });
-
-  socket.on("startGame", ({ roomId }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || socket.id !== room.hostId) return;
-    startGame(room.id);
-  });
-
-  // Se mantienen pero no se muestran en UI
-  socket.on("pauseDraw", ({ roomId }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || socket.id !== room.hostId) return;
-    room.paused = true;
-    stopTimer(room);
-    broadcastRoomState(room.id);
-  });
-  socket.on("resumeDraw", ({ roomId }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || socket.id !== room.hostId) return;
-    room.paused = false;
-    stopTimer(room);
-    startTimerIfNeeded(room);
-    broadcastRoomState(room.id);
-  });
-  socket.on("nextBall", ({ roomId }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room || socket.id !== room.hostId) return;
-    room.paused = true;
-    stopTimer(room);
-    const n = room.bag.pop();
-    if (n == null) return;
-    room.drawn.push(n);
-    io.to(room.id).emit("ball", n);
-    broadcastRoomState(room.id);
-  });
-
-  socket.on("claim", ({ roomId, figure, cardIndex, marked }) => {
-    try {
-      console.log(`Claim recibido de ${socket.id}:`, {
-        roomId,
-        figure,
-        cardIndex,
-        hasMarked: !!marked,
-      });
-      const rid = roomId || socket.data.roomId;
-
-      if (!rid) {
-        console.error("Error: No roomId available");
-        socket.emit("claimResult", { ok: false, reason: "no_room_id" });
-        return;
-      }
-
-      const res = figure
-        ? checkClaim(rid, socket.id, figure, cardIndex, marked)
-        : autoClaim(rid, socket.id, cardIndex, marked);
-
-      console.log(`Resultado del claim para ${socket.id}:`, res);
-      socket.emit("claimResult", res);
-    } catch (error) {
-      console.error("Error procesando claim:", error);
-      socket.emit("claimResult", { ok: false, reason: "server_error" });
-    }
-  });
-
-  socket.on("getState", ({ roomId }) => {
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room) return;
-    const publicPlayers = Array.from(room.players.entries()).map(
-      ([sid, p]) => ({
-        id: sid,
-        name: p.name,
-        avatarId: p.avatarId, // Solo enviar avatarId para caché eficiente
-        username: p.username,
-        cards: p.cards,
-      })
-    );
-    socket.emit("state", {
-      roomId: room.id,
-      name: room.name,
-      started: room.started,
-      paused: room.paused,
-      cardsPerPlayer: room.cardsPerPlayer,
-      hostId: room.hostId,
-      players: publicPlayers,
-      drawn: room.drawn,
-      lastBall: room.drawn[room.drawn.length - 1] || null,
-      figuresClaimed: room.figuresClaimed,
-      gameEnded: room.gameEnded,
-      playersReady: Array.from(room.playersReady),
-    });
-  });
-
-  // Stats y Leaderboard
-  socket.on("getStats", async ({ playerId }, cb) => {
-    try {
-      // usar username prioritariamente si está asociado al jugador en sala
-      const room = rooms.get(socket.data.roomId);
-      const p = room?.players.get(socket.id);
-      const username = playerId || p?.username;
-
-      if (username) {
-        // Usar Prisma/statsService para datos persistentes
-        const stats = await statsService.getPlayerStats(username, "bingo");
-        if (typeof cb === "function") cb({ ok: true, stats });
-        else socket.emit("stats", { ok: true, stats });
-      } else {
-        // Fallback a dataStore si no hay username
-        const stats = dataStore.getPlayerStats(socket.id) || {
-          totalGames: 0,
-          wins: 0,
-          points: 0,
-        };
-        if (typeof cb === "function") cb({ ok: true, stats });
-        else socket.emit("stats", { ok: true, stats });
-      }
-    } catch (e) {
-      console.error("Error getting stats:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  socket.on("getLeaderboard", async ({ gameKey, limit }, cb) => {
-    try {
-      const leaderboard = await statsService.getLeaderboard(
-        gameKey || "bingo",
-        limit || 10
-      );
-      if (typeof cb === "function") cb({ ok: true, leaderboard });
-      else socket.emit("leaderboard", { ok: true, leaderboard });
-    } catch (e) {
-      console.error("Error getting leaderboard:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  // Sincronización de avatares
-  socket.on("getAvatarById", async ({ avatarId }, cb) => {
-    try {
-      const avatar = await statsService.getAvatarById(avatarId);
-      if (typeof cb === "function") cb({ ok: !!avatar, avatar });
-    } catch (e) {
-      console.error("Error getting avatar:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  socket.on("syncAvatars", async ({ lastSync }, cb) => {
-    try {
-      const avatars = lastSync
-        ? await statsService.getPlayersWithAvatarsUpdatedAfter(lastSync)
-        : await statsService.getAllPlayersWithAvatars();
-      if (typeof cb === "function") cb({ ok: true, avatars });
-    } catch (e) {
-      console.error("Error syncing avatars:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  // Manejar mensajes de chat
-  socket.on("sendChatMessage", ({ roomId, message }) => {
-    console.log("Received chat message:", { roomId, message });
-    const room = rooms.get(roomId || socket.data.roomId);
-    if (!room) {
-      console.log("Room not found for chat message");
-      return;
-    }
-
-    // Verificar que el jugador está en la sala
-    if (!room.players.has(socket.id)) {
-      console.log("Player not in room for chat message");
-      return;
-    }
-
-    console.log(
-      "Broadcasting chat message to room:",
-      roomId || socket.data.roomId
-    );
-    // Reenviar el mensaje a todos en la sala
-    io.to(roomId || socket.data.roomId).emit("chatMessage", message);
-  });
-
-  // Nuevos endpoints para rankings y búsqueda
-  socket.on("getTopPlayers", async (params, cb) => {
-    console.log("[getTopPlayers] Solicitud recibida:", params);
-    try {
-      const { gameKey, criteria, limit } = params || {};
-      const topPlayers = await statsService.getTopPlayers(
-        gameKey || "bingo",
-        criteria || "points",
-        limit || 10
-      );
-      console.log("[getTopPlayers] Respuesta enviada:", topPlayers);
-      if (typeof cb === "function") cb({ ok: true, topPlayers });
-    } catch (e) {
-      console.error("Error getting top players:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  socket.on("searchPlayers", async ({ query, limit }, cb) => {
-    try {
-      const players = await statsService.searchPlayers(query, limit || 10);
-      if (typeof cb === "function") cb({ ok: true, players });
-    } catch (e) {
-      console.error("Error searching players:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  // Endpoint optimizado para obtener avatar por avatarId
-  socket.on("getAvatar", async ({ avatarId, clientHasCache }, cb) => {
-    console.log("📋 Received getAvatar request:", { avatarId, clientHasCache });
-
-    try {
-      if (!avatarId) {
-        if (typeof cb === "function")
-          cb({ ok: false, error: "AvatarId is required" });
-        return;
-      }
-
-      // Buscar jugador por avatarId en la base de datos
-      const player = await statsService.getPlayerByAvatarId(avatarId);
-
-      if (!player || !player.avatarUrl) {
-        console.log("❌ Avatar not found:", avatarId);
-        if (typeof cb === "function")
-          cb({ ok: false, error: "Avatar not found" });
-        return;
-      }
-
-      // Si el cliente dice que ya tiene este avatar en caché, solo confirmar
-      if (clientHasCache) {
-        console.log(
-          `✅ Client has cache for: ${player.username} -> ${avatarId} - SKIPPING TRANSFER`
-        );
-        if (typeof cb === "function")
-          cb({
-            ok: true,
-            cached: true,
-            avatar: {
-              avatarId: player.avatarId,
-              username: player.username,
-              // NO enviar avatarUrl si ya está en caché
-            },
-          });
-        return;
-      }
-
-      // Solo enviar el avatar completo si el cliente no lo tiene
-      console.log(
-        `📤 Sending avatar: ${player.username} -> ${avatarId} (${(
-          player.avatarUrl.length / 1024
-        ).toFixed(1)}KB)`
-      );
-
-      if (typeof cb === "function")
-        cb({
-          ok: true,
-          avatar: {
-            avatarId: player.avatarId,
-            avatarUrl: player.avatarUrl, // Solo enviar si no está en caché
-            username: player.username,
-          },
-        });
-    } catch (e) {
-      console.error("Error getting avatar:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  // ALTERNATIVA: Endpoint para verificar múltiples avatares de una vez
-  socket.on("checkAvatars", async ({ avatarIds, clientCachedIds }, cb) => {
-    console.log("📋 Batch avatar check:", {
-      avatarIds: avatarIds.length,
-      cached: clientCachedIds.length,
-    });
-
-    try {
-      const results = [];
-
-      for (const avatarId of avatarIds) {
-        const player = await statsService.getPlayerByAvatarId(avatarId);
-
-        if (player && player.avatarUrl) {
-          const needsDownload = !clientCachedIds.includes(avatarId);
-
-          results.push({
-            avatarId,
-            username: player.username,
-            needsDownload,
-            avatarUrl: needsDownload ? player.avatarUrl : undefined, // Solo incluir si necesita descarga
-          });
-        }
-      }
-
-      if (typeof cb === "function") cb({ ok: true, results });
-    } catch (e) {
-      console.error("Error checking avatars:", e);
-      if (typeof cb === "function") cb({ ok: false, error: e.message });
-    }
-  });
-
-  // Endpoint para comprimir todos los avatares existentes
-  socket.on("compressAllAvatars", async (data, cb) => {
-    console.log("🔧 Iniciando compresión masiva de avatares...");
-
-    try {
-      // Obtener todos los jugadores con avatares
-      const players = await statsService.getAllPlayersWithAvatars();
-
-      if (!players || players.length === 0) {
-        console.log("ℹ️ No se encontraron jugadores con avatares");
-        if (typeof cb === "function")
-          cb({
-            ok: true,
-            message: "No hay avatares para comprimir",
-            processed: 0,
-          });
-        return;
-      }
-
-      console.log(`📋 Encontrados ${players.length} jugadores con avatares`);
-
-      let processed = 0;
-      let compressed = 0;
-      let skipped = 0;
-      let errors = 0;
-
-      for (const player of players) {
-        try {
-          if (!player.avatarUrl) {
-            skipped++;
-            continue;
-          }
-
-          const originalSizeKB = player.avatarUrl.length / 1024;
-          console.log(
-            `\n🔄 Procesando: ${player.username} (${originalSizeKB.toFixed(
-              1
-            )}KB)`
-          );
-
-          // Si ya es menor a 100KB, no comprimir
-          if (originalSizeKB <= 100) {
-            console.log(`   ✅ Ya optimizado, saltando`);
-            skipped++;
-            processed++;
-            continue;
-          }
-
-          // Comprimir avatar
-          const compressedAvatar = await compressAvatar(player.avatarUrl, 50);
-          const newSizeKB = compressedAvatar.length / 1024;
-
-          // Actualizar en base de datos
-          await statsService.ensurePlayer(
-            player.username,
-            player.name,
-            compressedAvatar
-          );
-
-          console.log(
-            `   ✅ ${player.username}: ${originalSizeKB.toFixed(
-              1
-            )}KB → ${newSizeKB.toFixed(1)}KB`
-          );
-          compressed++;
-          processed++;
-        } catch (error) {
-          console.error(
-            `   ❌ Error procesando ${player.username}:`,
-            error.message
-          );
-          errors++;
-          processed++;
-        }
-      }
-
-      const summary = {
-        ok: true,
-        message: "Compresión masiva completada",
-        total: players.length,
-        processed,
-        compressed,
-        skipped,
-        errors,
-      };
-
-      console.log("\n📊 Resumen de compresión masiva:");
-      console.log(`   - Total jugadores: ${summary.total}`);
-      console.log(`   - Procesados: ${summary.processed}`);
-      console.log(`   - Comprimidos: ${summary.compressed}`);
-      console.log(`   - Saltados: ${summary.skipped}`);
-      console.log(`   - Errores: ${summary.errors}`);
-
-      if (typeof cb === "function") cb(summary);
-    } catch (error) {
-      console.error("💥 Error en compresión masiva:", error);
-      if (typeof cb === "function")
-        cb({
-          ok: false,
-          error: error.message,
-        });
-    }
-  });
-
-  // Endpoint para actualizar perfil OPTIMIZADO
-  socket.on("updateProfile", async ({ username, name, avatarUrl }, cb) => {
-    console.log("📥 Received updateProfile request:", {
-      username,
-      name,
-      hasAvatar: !!avatarUrl,
-      avatarSizeKB: avatarUrl ? (avatarUrl.length / 1024).toFixed(2) : 0,
-    });
-
-    try {
-      if (!username) {
-        console.log("❌ updateProfile failed: Username is required");
-        if (typeof cb === "function")
-          cb({ ok: false, error: "Username is required" });
-        return;
-      }
-
-      let processedAvatarUrl = avatarUrl;
-
-      if (avatarUrl) {
-        console.log("🖼️ Processing avatar...");
-        console.log(
-          "   - Original size:",
-          (avatarUrl.length / 1024).toFixed(2),
-          "KB"
-        );
-
-        // Verificar si es una imagen base64 válida
-        if (!avatarUrl.startsWith("data:image/")) {
-          console.log("❌ Avatar format invalid: must start with data:image/");
-          if (typeof cb === "function")
-            cb({
-              ok: false,
-              error: "Formato de imagen inválido",
-            });
-          return;
-        }
-
-        // Validar tamaño máximo original (5MB para dar margen de maniobra)
-        if (avatarUrl.length > 5 * 1024 * 1024) {
-          console.log(
-            "❌ updateProfile failed: Avatar too large (max 5MB for processing)"
-          );
-          if (typeof cb === "function")
-            cb({
-              ok: false,
-              error: "La imagen es demasiado grande (máximo 5MB)",
-            });
-          return;
-        }
-
-        try {
-          // Comprimir avatar si es mayor a 50KB
-          if (avatarUrl.length > 50 * 1024) {
-            console.log("🔧 Avatar needs compression, processing...");
-            processedAvatarUrl = await compressAvatar(avatarUrl, 50); // Target: 50KB
-          } else {
-            console.log("✅ Avatar size OK, no compression needed");
-            processedAvatarUrl = avatarUrl;
-          }
-        } catch (compressionError) {
-          console.error("❌ Avatar compression failed:", compressionError);
-          if (typeof cb === "function")
-            cb({
-              ok: false,
-              error: "Error procesando la imagen: " + compressionError.message,
-            });
-          return;
-        }
-      }
-
-      console.log("💾 Updating player profile in database...");
-      // Usar el avatar procesado/comprimido
-      const player = await statsService.ensurePlayer(
-        username,
-        name,
-        processedAvatarUrl
-      );
-      console.log(
-        `✅ Player profile updated: ${player.username} (Avatar: ${
-          processedAvatarUrl
-            ? (processedAvatarUrl.length / 1024).toFixed(1) + "KB"
-            : "none"
-        })`
-      );
-
-      // También actualizar en dataStore para la sesión actual
-      try {
-        dataStore.ensurePlayer(username, name, processedAvatarUrl);
-        console.log("✅ Player profile updated in dataStore");
-      } catch (e) {
-        console.warn("⚠️ Error updating dataStore:", e);
-      }
-
-      // 🔄 Sincronizar el perfil actualizado en todas las salas donde esté el jugador
-      console.log("🔄 Syncing updated profile across rooms...");
-      let roomsUpdated = 0;
-      for (const [roomId, room] of rooms.entries()) {
-        const playerInRoom = room.players.get(socket.id);
-        if (playerInRoom && playerInRoom.username === username) {
-          // Actualizar los datos del jugador en esta sala
-          room.players.set(socket.id, {
-            ...playerInRoom,
-            name: player.name,
-            avatarUrl: player.avatarUrl, // Avatar comprimido
-            avatarId: player.avatarId,
-          });
-
-          // Notificar a todos en la sala sobre la actualización
-          console.log(`📡 Broadcasting updated profile to room ${roomId}`);
-          broadcastRoomState(roomId);
-          roomsUpdated++;
-        }
-      }
-
-      console.log(`✅ Profile synced across ${roomsUpdated} room(s)`);
-
-      const response = {
-        ok: true,
-        player: {
-          username: player.username,
-          name: player.name,
-          avatarUrl: player.avatarUrl, // Avatar final comprimido
-          avatarId: player.avatarId,
-        },
-      };
-
-      console.log(
-        `📤 Sending updateProfile response (avatar: ${
-          response.player.avatarUrl
-            ? (response.player.avatarUrl.length / 1024).toFixed(1) + "KB"
-            : "none"
-        })`
-      );
-      if (typeof cb === "function") cb(response);
-    } catch (e) {
-      console.error("💥 Error updating profile:", e);
-      const errorResponse = { ok: false, error: e.message };
-      console.log("📤 Sending updateProfile error response:", errorResponse);
-      if (typeof cb === "function") cb(errorResponse);
-    }
-  });
-
-  socket.on("disconnect", () => {
-    const roomId = socket.data.roomId;
-    if (!roomId) return;
-    const room = rooms.get(roomId);
-    if (!room) return;
-
-    // Remover al jugador de la sala
-    room.players.delete(socket.id);
-    room.playersReady.delete(socket.id);
-
-    // Si era el anfitrión, transferir anfitrionazgo o eliminar sala
-    if (socket.id === room.hostId) {
-      if (room.players.size === 0) {
-        // No hay más jugadores, eliminar la sala (aunque esté en juego)
-        console.log(
-          `Eliminando sala ${roomId} por falta de jugadores (era del host)`
-        );
-        stopTimer(room);
-        if (room.announceTimeout) clearTimeout(room.announceTimeout);
-        rooms.delete(roomId);
-        broadcastRoomsList();
-        return;
-      } else {
-        // Transferir anfitrionazgo al jugador más antiguo
-        room.hostId = getOldestPlayer(room);
-      }
-    }
-
-    // 🔧 NUEVO: Si no hay jugadores restantes, eliminar sala aunque no sea el host
-    if (room.players.size === 0) {
-      console.log(
-        `Eliminando sala ${roomId} por falta de jugadores (último jugador se desconectó)`
-      );
-      stopTimer(room);
-      if (room.announceTimeout) clearTimeout(room.announceTimeout);
-      rooms.delete(roomId);
-      broadcastRoomsList();
-      return;
-    }
-
-    broadcastRoomState(roomId);
-    broadcastRoomsList();
-  });
+  socket.emit("rooms", roomsManager.getRoomsList(gameHandlers));
+
+  // 🏠 Eventos de Salas
+  socket.on("listRooms", roomHandlers.listRooms(socket));
+  socket.on("cleanupRooms", roomHandlers.cleanupRooms(socket));
+  socket.on("createRoom", roomHandlers.createRoom(socket));
+  socket.on("joinRoom", roomHandlers.joinRoom(socket));
+  socket.on("leaveRoom", roomHandlers.leaveRoom(socket));
+  socket.on("readyForNewGame", roomHandlers.readyForNewGame(socket));
+
+  // 🎮 Eventos de Flujo del Juego
+  socket.on("configure", gameFlowHandlers.configure(socket));
+  socket.on("setSpeed", gameFlowHandlers.setSpeed(socket));
+  socket.on("startGame", gameFlowHandlers.startGame(socket));
+  socket.on("getState", gameFlowHandlers.getState(socket));
+
+  // 🎮 Eventos de Flujo del Juego Bingo
+  socket.on("pauseDraw", gameFlowHandlers.pauseDraw(socket));
+  socket.on("resumeDraw", gameFlowHandlers.resumeDraw(socket));
+  socket.on("nextBall", gameFlowHandlers.nextBall(socket));
+  socket.on("claim", gameFlowHandlers.claim(socket));
+
+  // 🃏 Eventos específicos del Truco
+  socket.on("playCard", roomHandlers.playCard(socket));
+  socket.on("envido", roomHandlers.envido(socket));
+  socket.on("envidoResponse", roomHandlers.envidoResponse(socket));
+  socket.on("skipEnvido", roomHandlers.skipEnvido(socket));
+  socket.on("truco", roomHandlers.truco(socket));
+  socket.on("trucoResponse", roomHandlers.trucoResponse(socket));
+  socket.on("requestPrivateHand", roomHandlers.requestPrivateHand(socket));
+
+  // 📊 Eventos de Estadísticas y Perfiles
+  socket.on("getStats", statsHandlers.getStats(socket));
+  socket.on("getLeaderboard", statsHandlers.getLeaderboard(socket));
+  socket.on("getTopPlayers", statsHandlers.getTopPlayers(socket));
+  socket.on("searchPlayers", statsHandlers.searchPlayers(socket));
+  socket.on("getAvatar", statsHandlers.getAvatar(socket));
+  socket.on("getAvatarById", statsHandlers.getAvatarById(socket));
+  socket.on("syncAvatars", statsHandlers.syncAvatars(socket));
+  socket.on("checkAvatars", statsHandlers.checkAvatars(socket));
+  socket.on("updateProfile", statsHandlers.updateProfile(socket));
+  socket.on("compressAllAvatars", statsHandlers.compressAllAvatars(socket));
+
+  // 💬 Eventos de Chat
+  socket.on("sendChatMessage", chatHandlers.sendChatMessage(socket));
+
+  // 🔌 Desconexión
+  socket.on("disconnect", disconnectHandler(socket));
 });
 
 app.get("/", (_req, res) => res.send("Bingo backend OK"));
