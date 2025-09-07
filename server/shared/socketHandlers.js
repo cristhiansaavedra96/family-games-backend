@@ -1,5 +1,10 @@
 const { syncPlayerWithDatabase } = require("./playerManager");
 
+// Mapa para manejar períodos de gracia en desconexiones: socketId -> timeout
+const pendingDisconnects = new Map();
+// Estado de usuarios en background: socketId -> timestamp cuando pasó a background
+const backgroundUsers = new Map();
+
 /**
  * Crea los manejadores de eventos Socket.IO para gestión de salas
  * @param {object} dependencies - Dependencias necesarias
@@ -127,6 +132,16 @@ function createRoomHandlers({
         let { name, avatarUrl, username } = player || {};
         let avatarId = null;
 
+        // Si existe un jugador en la sala con el mismo username y estaba pendiente de desconexión, cancelar el timeout
+        if (username) {
+          for (const [sockId, p] of room.players.entries()) {
+            if (p.username === username && pendingDisconnects.has(sockId)) {
+              clearTimeout(pendingDisconnects.get(sockId));
+              pendingDisconnects.delete(sockId);
+            }
+          }
+        }
+
         // Sincronizar jugador con base de datos
         const syncResult = await syncPlayerWithDatabase(
           username,
@@ -166,9 +181,27 @@ function createRoomHandlers({
       const result = roomsManager.removePlayerFromRoom(roomId, socket.id);
       if (!result) return;
 
-      const { room, shouldDelete } = result;
+      const { room, shouldDelete, removedPlayer } = result;
       socket.leave(roomId);
       socket.data.roomId = null;
+
+      // Notificación inmediata a restantes jugadores (sin esperar timeout de gracia)
+      if (removedPlayer && room.players.size > 0) {
+        try {
+          io.to(room.id).emit("playerDisconnected", {
+            username: removedPlayer.username,
+            name: removedPlayer.name,
+            avatarId: removedPlayer.avatarId,
+            playerId: socket.id,
+            roomId: room.id,
+            voluntary: true,
+            reason: "left",
+            timestamp: Date.now(),
+          });
+        } catch (err) {
+          console.error("Error emitiendo playerDisconnected (leaveRoom):", err);
+        }
+      }
 
       if (shouldDelete) {
         cleanupGameHandler(roomId);
@@ -180,6 +213,62 @@ function createRoomHandlers({
       broadcastRoomState(roomId);
       broadcastRoomsList();
     },
+
+    // Expulsar jugador (solo host)
+    kickPlayer:
+      (socket) =>
+      ({ roomId, targetPlayerId }) => {
+        const rid = roomId || socket.data.roomId;
+        if (!rid) return;
+        const room = roomsManager.getRoom(rid);
+        if (!room) return;
+        if (room.hostId !== socket.id) return; // Solo host
+        if (!room.players.has(targetPlayerId)) return;
+
+        const result = roomsManager.removePlayerFromRoom(rid, targetPlayerId);
+        if (!result) return;
+        const { room: updatedRoom, shouldDelete, removedPlayer } = result;
+
+        // Notificar al expulsado
+        try {
+          const targetSocket =
+            socket.server.sockets.sockets.get(targetPlayerId);
+          if (targetSocket) {
+            targetSocket.leave(rid);
+            targetSocket.emit("kicked", { roomId: rid });
+            targetSocket.data.roomId = null;
+          }
+        } catch (e) {
+          console.error("Error notificando kick al jugador:", e);
+        }
+
+        // Notificación a restantes
+        if (removedPlayer && updatedRoom.players.size > 0) {
+          try {
+            io.to(updatedRoom.id).emit("playerDisconnected", {
+              username: removedPlayer.username,
+              name: removedPlayer.name,
+              avatarId: removedPlayer.avatarId,
+              playerId: targetPlayerId,
+              roomId: updatedRoom.id,
+              reason: "kick",
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            console.error("Error emitiendo playerDisconnected (kick):", err);
+          }
+        }
+
+        if (shouldDelete) {
+          cleanupGameHandler(rid);
+          roomsManager.deleteRoom(rid);
+          broadcastRoomsList();
+          return;
+        }
+
+        broadcastRoomState(rid);
+        broadcastRoomsList();
+      },
 
     // Jugador listo para nueva partida
     readyForNewGame:
@@ -1068,6 +1157,14 @@ function createChatHandlers({ roomsManager, io }) {
         // Reenviar el mensaje a todos en la sala
         io.to(roomId || socket.data.roomId).emit("chatMessage", message);
       },
+    // Marcar que la app pasó a background (para ampliar período de gracia)
+    appBackground: (socket) => () => {
+      backgroundUsers.set(socket.id, Date.now());
+    },
+    // Marcar que la app volvió a foreground
+    appForeground: (socket) => () => {
+      backgroundUsers.delete(socket.id);
+    },
   };
 }
 
@@ -1081,31 +1178,72 @@ function createDisconnectHandler({
   cleanupGameHandler,
   broadcastRoomState,
   broadcastRoomsList,
+  io,
 }) {
   return (socket) => () => {
-    // Remover el jugador de todas las salas donde pueda estar
-    const removedResults = roomsManager.removePlayerFromAllRooms(socket.id);
-
-    if (removedResults.length === 0) return;
-
-    // Procesar cada sala de la que fue removido
-    for (const result of removedResults) {
-      const { room, shouldDelete } = result;
-
-      if (shouldDelete) {
-        // Limpiar game handler y eliminar sala
-        cleanupGameHandler(room.id);
-        roomsManager.deleteRoom(room.id);
-        console.log(`Eliminando sala ${room.id} por falta de jugadores`);
-      } else {
-        // Solo notificar cambios en la sala
-        broadcastRoomState(room.id);
+    // Determinar si el jugador es host de alguna sala para extender siempre el período de gracia
+    let isHostSomewhere = false;
+    for (const room of roomsManager.getAllRooms()) {
+      if (room.hostId === socket.id) {
+        isHostSomewhere = true;
+        break;
       }
     }
+    // Si el usuario estaba en background recientemente, o es host, darle gracia extendida (5 minutos)
+    const wasBackground = backgroundUsers.has(socket.id);
+    const EXTENDED_GRACE_MS = 5 * 60 * 1000;
+    const DEFAULT_GRACE_MS = 15000;
+    const graceMs =
+      wasBackground || isHostSomewhere ? EXTENDED_GRACE_MS : DEFAULT_GRACE_MS;
+    console.log(
+      `[Disconnect] Socket ${socket.id} scheduled removal in ${graceMs}ms (background=${wasBackground} host=${isHostSomewhere})`
+    );
+    const toSchedule = setTimeout(() => {
+      // Remover el jugador de todas las salas donde pueda estar
+      const removedResults = roomsManager.removePlayerFromAllRooms(socket.id);
+      pendingDisconnects.delete(socket.id);
+      backgroundUsers.delete(socket.id);
 
-    // Actualizar lista de salas una sola vez al final
-    broadcastRoomsList();
-    socket.data.roomId = null;
+      if (removedResults.length === 0) return;
+
+      // Procesar cada sala de la que fue removido
+      for (const result of removedResults) {
+        const { room, shouldDelete, removedPlayer } = result;
+
+        if (shouldDelete) {
+          // Limpiar game handler y eliminar sala
+          cleanupGameHandler(room.id);
+          roomsManager.deleteRoom(room.id);
+          console.log(`Eliminando sala ${room.id} por falta de jugadores`);
+        } else {
+          // Solo notificar cambios en la sala
+          broadcastRoomState(room.id);
+        }
+
+        // Emitir notificación de desconexión a los jugadores restantes de la sala
+        if (removedPlayer && room.players.size > 0) {
+          try {
+            io.to(room.id).emit("playerDisconnected", {
+              username: removedPlayer.username,
+              name: removedPlayer.name,
+              avatarId: removedPlayer.avatarId,
+              playerId: socket.id,
+              roomId: room.id,
+              reason: "timeout",
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            console.error("Error emitiendo playerDisconnected:", err);
+          }
+        }
+      }
+
+      // Actualizar lista de salas una sola vez al final
+      broadcastRoomsList();
+      socket.data.roomId = null;
+    }, graceMs);
+
+    pendingDisconnects.set(socket.id, toSchedule);
   };
 }
 

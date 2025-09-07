@@ -133,9 +133,14 @@ class RoomsManager {
     if (!room) return null;
 
     // Eliminar cualquier jugador anterior con el mismo username
+    let replacingHost = false;
     if (playerData.username) {
       for (const [sockId, p] of room.players.entries()) {
         if (p.username && p.username === playerData.username) {
+          // Si el socket que se elimina era el host, marcamos para reasignar hostId al nuevo socket
+          if (sockId === room.hostId) {
+            replacingHost = true;
+          }
           room.players.delete(sockId);
           room.playersReady && room.playersReady.delete(sockId);
         }
@@ -146,8 +151,9 @@ class RoomsManager {
       ...playerData,
       joinedAt: Date.now(),
     });
-
-    if (!room.hostId) {
+    // Si la sala no tenía host aún, o estamos reemplazando al host anterior (misma identidad / username),
+    // asignar el nuevo socket como host para evitar perder anfitrión en reconexiones.
+    if (!room.hostId || replacingHost) {
       room.hostId = socketId;
     }
 
@@ -158,6 +164,8 @@ class RoomsManager {
   removePlayerFromRoom(roomId, socketId) {
     const room = this.getRoom(roomId);
     if (!room) return null;
+    // Capturar datos del jugador antes de eliminarlo para notificaciones
+    const removedPlayer = room.players.get(socketId) || null;
 
     room.players.delete(socketId);
     room.playersReady.delete(socketId);
@@ -165,7 +173,7 @@ class RoomsManager {
     // Si era el anfitrión, transferir anfitrionazgo o marcar para eliminación
     if (socketId === room.hostId) {
       if (room.players.size === 0) {
-        return { room, shouldDelete: true };
+        return { room, shouldDelete: true, removedPlayer };
       } else {
         room.hostId = this.getOldestPlayer(room);
       }
@@ -173,10 +181,9 @@ class RoomsManager {
 
     // Si no hay más jugadores, marcar para eliminación
     if (room.players.size === 0) {
-      return { room, shouldDelete: true };
+      return { room, shouldDelete: true, removedPlayer };
     }
-
-    return { room, shouldDelete: false };
+    return { room, shouldDelete: false, removedPlayer };
   }
 
   // Elimina una sala

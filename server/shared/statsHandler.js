@@ -108,9 +108,47 @@ function createSearchPlayersHandler() {
   };
 }
 
+// Nuevo: obtener perfil completo (player + stats opcionales)
+function createGetPlayerProfileHandler() {
+  return async function getPlayerProfileHandler({ username, gameKey }, cb) {
+    try {
+      const canonical = statsService._canonicalize(username);
+      const player = await statsService.getPlayerByUsername(canonical);
+      if (!player) {
+        const result = { ok: false, error: "PLAYER_NOT_FOUND" };
+        if (typeof cb === "function") cb(result);
+        else return result;
+        return;
+      }
+      const stats = await statsService.getPlayerStats(
+        canonical,
+        gameKey || "bingo"
+      );
+      const response = {
+        ok: true,
+        player: {
+          username: player.username,
+          name: player.name,
+          avatarUrl: player.avatarUrl,
+          avatarId: player.avatarId,
+        },
+        stats,
+      };
+      if (typeof cb === "function") cb(response);
+      else return response;
+    } catch (e) {
+      console.error("[getPlayerProfile] error", e);
+      const error = { ok: false, error: e.message };
+      if (typeof cb === "function") cb(error);
+      else return error;
+    }
+  };
+}
+
 module.exports = {
   createGetStatsHandler,
   createGetLeaderboardHandler,
   createGetTopPlayersHandler,
   createSearchPlayersHandler,
+  createGetPlayerProfileHandler,
 };
