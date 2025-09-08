@@ -199,14 +199,13 @@ const statsService = {
   },
 
   async getLeaderboard(gameKey = "bingo", limit = 10) {
-    console.log("[statsService.getLeaderboard] query start", {
-      gameKey,
-      limit,
-    });
     const stats = await prisma.playerGameStats.findMany({
       where: { gameKey },
       include: { Player: true },
+      orderBy: [{ points: "desc" }, { wins: "desc" }],
+      take: limit, // 👈 limit aplicado desde la query
     });
+
     const mapped = stats.map((s, index) => ({
       rank: index + 1,
       username: s.playerUsername,
@@ -222,10 +221,7 @@ const statsService = {
           : 0,
       updatedAt: s.Player?.updatedAt,
     }));
-    console.log(
-      "[statsService.getLeaderboard] query end count=",
-      mapped.length
-    );
+
     return mapped;
   },
 
