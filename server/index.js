@@ -70,6 +70,9 @@ function cleanupGameHandler(roomId) {
 
 // Función para asegurar que un jugador solo esté en una sala
 function ensurePlayerInSingleRoom(socket, targetRoomId = null) {
+  console.log(
+    `[DEBUG] ensurePlayerInSingleRoom called for player: ${socket.id}, targetRoom: ${targetRoomId}`
+  );
   const currentRoom = roomsManager.findPlayerRoom(socket.id);
 
   if (currentRoom && currentRoom.id !== targetRoomId) {
@@ -293,7 +296,38 @@ io.on("connection", (socket) => {
   socket.on("trucoResponse", roomHandlers.trucoResponse(socket));
   socket.on("requestPrivateHand", roomHandlers.requestPrivateHand(socket));
 
-  // 📊 Eventos de Estadísticas y Perfiles
+  // � Eventos específicos de UNO (faltaban bindings)
+  socket.on("drawCard", roomHandlers.drawCard(socket));
+  socket.on("declareUno", roomHandlers.declareUno(socket));
+  socket.on("callOutUno", roomHandlers.callOutUno(socket));
+  socket.on("challengeWild4", roomHandlers.challengeWild4(socket));
+  socket.on("acceptWild4", roomHandlers.acceptWild4(socket));
+
+  // 🛰 Logger genérico para depuración (se puede retirar luego)
+  socket.onAny((event, ...args) => {
+    if (
+      [
+        "drawCard",
+        "playCard",
+        "declareUno",
+        "callOutUno",
+        "challengeWild4",
+        "acceptWild4",
+      ].includes(event)
+    ) {
+      try {
+        const payload = args && args[0];
+        console.log(
+          `⚡ [onAny] Evento '${event}' recibido de ${socket.id}`,
+          payload && typeof payload === "object" ? payload : ""
+        );
+      } catch (e) {
+        // ignorar
+      }
+    }
+  });
+
+  // �📊 Eventos de Estadísticas y Perfiles
   socket.on("getStats", statsHandlers.getStats(socket));
   socket.on("getLeaderboard", statsHandlers.getLeaderboard(socket));
   socket.on("getTopPlayers", statsHandlers.getTopPlayers(socket));

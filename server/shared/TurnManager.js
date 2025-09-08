@@ -9,7 +9,8 @@ class TurnManager {
     this.teamPlayers = new Map(); // Map: teamId -> [playerIds]
     this.currentPlayerIndex = 0;
     this.direction = 1; // 1 = sentido horario, -1 = antihorario
-    this.skipNext = false; // Para saltar el siguiente turno
+    // Flag interno para saltar el siguiente turno (no usar nombre skipNext para no ocultar el método)
+    this.skipNextFlag = false;
     this.maxSkips = options.maxSkips || 1; // Máximo de saltos consecutivos
     this.currentSkips = 0;
 
@@ -32,7 +33,7 @@ class TurnManager {
     this.players = [...players];
     this.currentPlayerIndex = 0;
     this.direction = 1;
-    this.skipNext = false;
+    this.skipNextFlag = false;
     this.currentSkips = 0;
 
     // Configurar equipos
@@ -173,13 +174,13 @@ class TurnManager {
     const previousIndex = this.currentPlayerIndex;
 
     // Verificar si hay que saltar este turno
-    if (this.skipNext && this.currentSkips < this.maxSkips) {
+    if (this.skipNextFlag && this.currentSkips < this.maxSkips) {
       this.currentSkips++;
       const skippedPlayer = this.getCurrentPlayer();
 
       // Avanzar al siguiente
       this.currentPlayerIndex = this.getNextPlayerIndex();
-      this.skipNext = false;
+      this.skipNextFlag = false;
 
       // Callback de jugador saltado
       if (this.onPlayerSkipped) {
@@ -244,8 +245,13 @@ class TurnManager {
    * @param {boolean} skip - Si debe saltarse el siguiente turno
    */
   setSkipNext(skip = true) {
-    this.skipNext = skip;
+    this.skipNextFlag = skip;
     console.log(`⏭️ Skip siguiente turno: ${skip}`);
+  }
+
+  // Atajo para compatibilidad (ej: UnoGameHandler llama skipNext())
+  skipNext() {
+    this.setSkipNext(true);
   }
 
   /**
@@ -302,7 +308,7 @@ class TurnManager {
       currentPlayer: this.getCurrentPlayer(),
       currentPlayerIndex: this.currentPlayerIndex,
       direction: this.direction,
-      skipNext: this.skipNext,
+      skipNext: this.skipNextFlag,
       currentSkips: this.currentSkips,
       maxSkips: this.maxSkips,
       teams: this.getTeamsInfo(),
@@ -329,7 +335,7 @@ class TurnManager {
   reset() {
     this.currentPlayerIndex = 0;
     this.direction = 1;
-    this.skipNext = false;
+    this.skipNextFlag = false;
     this.currentSkips = 0;
 
     console.log(`🔄 TurnManager reiniciado`);
