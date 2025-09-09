@@ -52,8 +52,11 @@ class UnoGameHandler extends BaseGameHandler {
     this.unoState = {
       // playerId -> { declared:boolean, atOneSince:number, penalized:boolean }
       players: new Map(),
-      graceMs: 1500, // 1.5 segundos de gracia para decir UNO
+      graceMs: 2000, // 2 segundos de gracia para decir UNO
     };
+
+    // Timers para ventanas de reclamo de UNO
+    this.unoClaimTimers = new Map(); // playerId -> timeoutId
 
     // Estado para challenge de wild draw 4
     this.wild4Challenge = null; // { playedBy, targetPlayer, snapshotHand, chosenColor, createdAt, timeoutAt, resolved }
@@ -465,6 +468,12 @@ class UnoGameHandler extends BaseGameHandler {
     this.wild4Challenge = null;
     this.unoState.players.clear();
 
+    // Limpiar timers de ventanas de reclamo UNO
+    for (const timerId of this.unoClaimTimers.values()) {
+      clearTimeout(timerId);
+    }
+    this.unoClaimTimers.clear();
+
     // Solo jugadores no eliminados
     const activePlayers = this.gameState.players.filter(
       (pid) => !this.gameState.eliminatedPlayers.has(pid)
@@ -770,6 +779,41 @@ class UnoGameHandler extends BaseGameHandler {
           playerId,
           graceMs: this.unoState.graceMs,
         });
+
+        // Configurar timer para abrir ventana de reclamo después del período de gracia
+        const timerId = setTimeout(() => {
+          // Verificar que el jugador sigue con 1 carta y no ha declarado UNO
+          const currentHand = this.gameState.hands[playerId] || [];
+          const currentInfo = this.unoState.players.get(playerId);
+
+          if (
+            currentHand.length === 1 &&
+            currentInfo &&
+            !currentInfo.declared &&
+            !currentInfo.penalized
+          ) {
+            // Obtener nombre del jugador
+            const player = this.room.players.get(playerId);
+            const playerName = player?.name || player?.username || "Jugador";
+
+            // Abrir ventana de reclamo
+            this.io.to(this.room.id).emit("unoClaimWindowOpen", {
+              playerId,
+              playerName,
+              gracePeriodMs: this.unoState.graceMs,
+            });
+
+            console.log(
+              `[UNO] Claim window opened for player ${playerName} (${playerId})`
+            );
+          }
+
+          // Limpiar el timer
+          this.unoClaimTimers.delete(playerId);
+        }, this.unoState.graceMs);
+
+        // Guardar el timer para poder cancelarlo si es necesario
+        this.unoClaimTimers.set(playerId, timerId);
       }
     } else {
       // Más de una carta -> limpiar
@@ -781,8 +825,21 @@ class UnoGameHandler extends BaseGameHandler {
     const hand = this.gameState.hands[playerId] || [];
     if (hand.length !== 1) {
       if (this.unoState.players.has(playerId)) {
+        // Cancelar timer de ventana de reclamo si existe
+        const timerId = this.unoClaimTimers.get(playerId);
+        if (timerId) {
+          clearTimeout(timerId);
+          this.unoClaimTimers.delete(playerId);
+        }
+
         this.unoState.players.delete(playerId);
         this.io.to(this.room.id).emit("unoStateCleared", { playerId });
+
+        // Cerrar ventana de reclamo si estaba abierta
+        this.io.to(this.room.id).emit("unoClaimWindowClosed", {
+          playerId,
+          reason: "more_cards",
+        });
       }
     }
   }
@@ -791,8 +848,24 @@ class UnoGameHandler extends BaseGameHandler {
     const info = this.unoState.players.get(socketId);
     if (!info) return { ok: false, reason: "not_at_uno" };
     if (info.declared) return { ok: false, reason: "already_declared" };
+
     info.declared = true;
+
+    // Cancelar timer de ventana de reclamo si existe
+    const timerId = this.unoClaimTimers.get(socketId);
+    if (timerId) {
+      clearTimeout(timerId);
+      this.unoClaimTimers.delete(socketId);
+    }
+
     this.io.to(this.room.id).emit("unoDeclared", { playerId: socketId });
+
+    // Cerrar ventana de reclamo
+    this.io.to(this.room.id).emit("unoClaimWindowClosed", {
+      playerId: socketId,
+      reason: "declared",
+    });
+
     return { ok: true };
   }
 
@@ -810,6 +883,13 @@ class UnoGameHandler extends BaseGameHandler {
       return { ok: false, reason: "grace_period" };
     }
 
+    // Cancelar timer de ventana de reclamo si existe
+    const timerId = this.unoClaimTimers.get(targetPlayerId);
+    if (timerId) {
+      clearTimeout(timerId);
+      this.unoClaimTimers.delete(targetPlayerId);
+    }
+
     // Penalizar +2 cartas
     for (let i = 0; i < 2; i++) {
       drawOne(this.gameState, targetPlayerId);
@@ -818,13 +898,22 @@ class UnoGameHandler extends BaseGameHandler {
     this.io.to(targetPlayerId).emit("privateHand", {
       hand: this.gameState.hands[targetPlayerId],
     });
+
     // Limpiar estado UNO (ya no está a una carta)
     this.clearUnoStateIfNeeded(targetPlayerId);
+
     this.io.to(this.room.id).emit("unoCalledOut", {
       target: targetPlayerId,
       by: socketId,
       penalty: 2,
     });
+
+    // Cerrar ventana de reclamo
+    this.io.to(this.room.id).emit("unoClaimWindowClosed", {
+      playerId: targetPlayerId,
+      reason: "claimed",
+    });
+
     return { ok: true, penalty: 2 };
   }
 
@@ -848,27 +937,51 @@ class UnoGameHandler extends BaseGameHandler {
       }
     }
 
-    // IMPORTANT: No sobreescribir la lista de jugadores del lobby antes de que el juego empiece
-    // (el broadcast en index.js primero arma 'players' con nombres/avatar y luego mezcla este objeto).
-    // Si devolvemos 'players' cuando aún no empezó, la sobrescribimos con un array vacío (porque gameState.players
-    // solo se llena al iniciar) y en el frontend se ve "0 jugadores".
-    const includePlayers = this.gameState.started;
+    // IMPORTANT: Preservar datos de jugadores del lobby para evitar parpadeo
+    // En lugar de no enviar players cuando no ha empezado, enviar los datos completos
+    // mezclando la información del lobby con el estado del juego
     let playersSection = {};
-    if (includePlayers) {
+
+    if (this.gameState.started) {
+      // Juego iniciado: usar gameState.players con datos del lobby
       playersSection.players = this.gameState.players.map((pid) => {
-        // Intentar tomar metadatos del room original (nombres, avatar) si existen
         const roomPlayer = this.room.players.get(pid) || {};
         return {
           id: pid,
           handCount: (this.gameState.hands[pid] || []).length,
           name: roomPlayer.name,
           username: roomPlayer.username,
-          avatarId: roomPlayer.avatarId,
+          avatarId: roomPlayer.avatarId, // Solo avatarId, no avatarUrl
           totalPoints: this.gameState.scores
             ? this.gameState.scores[pid] || 0
             : 0,
         };
       });
+
+      // Debug: solo loggear cuando hay cambios significativos, no en cada estado
+      if (playersSection.players.some((p) => p.handCount === 1)) {
+        console.log(`[UNO] Game state update - players with 1 card detected`);
+      }
+    } else {
+      // Juego no iniciado: enviar datos del lobby para mantener consistencia
+      const lobbyPlayers = Array.from(this.room.players.entries()).map(
+        ([sid, p]) => ({
+          id: sid,
+          name: p.name,
+          username: p.username,
+          avatarId: p.avatarId, // Solo avatarId, no avatarUrl
+          handCount: 0, // Sin cartas antes de empezar
+          totalPoints: this.gameState.scores
+            ? this.gameState.scores[sid] || 0
+            : 0,
+        })
+      );
+      playersSection.players = lobbyPlayers;
+
+      // Debug: solo loggear al inicio del juego, no constantemente
+      if (lobbyPlayers.length > 0) {
+        console.log(`[UNO] Lobby state - ${lobbyPlayers.length} players ready`);
+      }
     }
 
     return {

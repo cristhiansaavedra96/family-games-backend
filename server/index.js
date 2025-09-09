@@ -118,8 +118,7 @@ function broadcastRoomState(roomId) {
   const publicPlayers = Array.from(room.players.entries()).map(([sid, p]) => ({
     id: sid,
     name: p.name,
-    avatarUrl: p.avatarUrl,
-    avatarId: p.avatarId,
+    avatarId: p.avatarId, // Solo avatarId, no avatarUrl
     username: p.username,
     cards: p.cards,
   }));
@@ -145,13 +144,16 @@ function broadcastRoomState(roomId) {
     name: room.name,
     gameKey: room.gameKey,
     hostId: room.hostId,
-    players: publicPlayers,
+    players: gameState.players || publicPlayers, // Priorizar gameState.players si existe
     gameEnded: room.gameEnded,
     playersReady: Array.from(room.playersReady),
     // Configuración completa (sala + juego específico)
     ...fullConfig,
-    // Estado del juego (debe tener prioridad)
-    ...gameState,
+    // Estado del juego (sin players para evitar sobrescribir)
+    ...((gameState) => {
+      const { players, ...gameStateWithoutPlayers } = gameState;
+      return gameStateWithoutPlayers;
+    })(gameState),
   };
 
   console.log(
